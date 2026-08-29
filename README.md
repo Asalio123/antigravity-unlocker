@@ -1,4 +1,4 @@
-# Antigravity Unlocker для macOS и Linux 🔓
+# Antigravity Unlocker для macOS и Linux
 
 Порт популярного Windows-анлокера [confeden/Antigravity](https://github.com/confeden/Antigravity).
 Позволяет пользоваться **Google Antigravity** (Desktop-приложение) из России — **без VPN и без смены региона Google-аккаунта**.
