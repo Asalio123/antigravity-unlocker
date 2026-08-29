@@ -1,12 +1,17 @@
-# Antigravity Unlocker для macOS 🔓
+# Antigravity Unlocker для macOS и Linux 🔓
 
-Порт популярного Windows-анлокера [confeden/Antigravity](https://github.com/confeden/Antigravity) на macOS.
+Порт популярного Windows-анлокера [confeden/Antigravity](https://github.com/confeden/Antigravity).
 Позволяет пользоваться **Google Antigravity** (Desktop-приложение) из России — **без VPN и без смены региона Google-аккаунта**.
 
-> **Важно про скоуп:** скрипт для **Antigravity (Desktop)** — основного приложения со страницы [antigravity.google/download](https://antigravity.google/download). Standalone «Antigravity IDE» с той же страницы — отдельный продукт, его работа не проверялась.
+| Платформа | Скрипт | Статус |
+|---|---|---|
+| macOS 12+ (Apple Silicon / Intel) | [`ag_unlocker_mac.sh`](ag_unlocker_mac.sh) | ✅ проверено на 2.10.0 / 2.11.0 |
+| Linux x86_64 (.deb / .rpm) | [`linux/ag_unlocker_linux.sh`](linux/ag_unlocker_linux.sh) | ✅ патч верифицирован на 2.11.0 .deb |
+
+> **Важно про скоуп:** скрипты для **Antigravity (Desktop)** — основного приложения со страницы [antigravity.google/download](https://antigravity.google/download). Standalone «Antigravity IDE» с той же страницы — отдельный продукт, его работа не проверялась.
 >
-> Скрипт написан с нуля на чистом bash, повторяет проверенные методы оригинала.
-> Только штатные инструменты macOS — никаких зависимостей, ничего не устанавливает.
+> Скрипты написаны с нуля на чистом bash, повторяют проверенные методы оригинала.
+> Только штатные инструменты системы — никаких зависимостей сверх базовых, ничего не устанавливают.
 
 ---
 
@@ -57,10 +62,14 @@ curl -sL -o ag_unlocker_mac.sh https://github.com/Asalio123/antigravity-unlocker
 **Шаг 3.** Запусти:
 
 ```bash
-sudo bash ag_unlocker_mac.sh
+sudo bash ag_unlocker_mac.sh          # macOS
+sudo bash linux/ag_unlocker_linux.sh  # Linux
 ```
 
-> Скрипт просит права администратора, потому что пишет в `/Applications` (патч бинарей) и `/etc/hosts` (DNS-пин).
+> macOS: скрипт просит права администратора, потому что пишет в `/Applications` и `/etc/hosts`.
+> Linux: нужен root по той же причине; дополнительно нужен `dig` — на Debian/Ubuntu `sudo apt install -y dnsutils`, на Fedora/RHEL `sudo dnf install -y bind-utils`.
+>
+> ⚠️ **Linux, AppImage:** в AppImage-версии патч невозможен (файл временный) — ставь `.deb` или `.rpm`.
 
 ---
 
@@ -163,12 +172,13 @@ Google выпустили обновление, в котором изменил
 
 ## Проверенные версии
 
-| Версия Antigravity | Версия скрипта | Статус |
+| Версия Antigravity | Платформа | Статус |
 |---|---|---|
-| 2.11.0 (macOS arm64) | 1.0 | ✅ работает |
-| 2.10.0 (macOS arm64) | 1.0 | ✅ работает |
+| 2.11.0 | macOS arm64 | ✅ полная проверка |
+| 2.10.0 | macOS arm64 | ✅ полная проверка |
+| 2.11.0 | Linux x86_64 (.deb) | ✅ патч верифицирован (строки, размер, обратимость); GUI-прогон — по фидбеку |
 
-Другие версии не тестировались, но механизм версии-независимый: если строка `ineligible` в бинаре есть — патч сработает.
+Механизм версии-независимый: если строка `ineligible` в бинаре есть — патч сработает. Нет — скрипт честно скажет «новая сборка» и ничего не тронет.
 
 ---
 
