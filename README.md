@@ -5,8 +5,8 @@
 
 | Платформа | Скрипт | Статус |
 |---|---|---|
-| macOS 12+ (Apple Silicon / Intel) | [`ag_unlocker_mac.sh`](ag_unlocker_mac.sh) | ✅ проверено на 2.10.0 / 2.11.0 |
 | Linux x86_64 (.deb / .rpm) | [`linux/ag_unlocker_linux.sh`](linux/ag_unlocker_linux.sh) | ✅ патч верифицирован на 2.11.0 .deb |
+| macOS 12+ (Apple Silicon / Intel) | [`macos/ag_unlocker_mac.sh`](macos/ag_unlocker_mac.sh) | ✅ проверено на 2.10.0 / 2.11.0 |
 
 > **Важно про скоуп:** скрипты для **Antigravity (Desktop)** — основного приложения со страницы [antigravity.google/download](https://antigravity.google/download). Standalone «Antigravity IDE» с той же страницы — отдельный продукт, его работа не проверялась.
 >
@@ -39,9 +39,11 @@ Google закрыл Antigravity для российских аккаунтов �
 
 ## Требования
 
-- macOS 12+ (Apple Silicon или Intel)
-- **Antigravity (Desktop)**: [antigravity.google/download](https://antigravity.google/download) — основной .dmg
-- Google-аккаунт (любой страны)
+**macOS:** 12+ (Apple Silicon или Intel), Antigravity `.dmg` с [antigravity.google/download](https://antigravity.google/download)
+
+**Linux:** x86_64, Antigravity `.deb` или `.rpm` (AppImage не поддерживается — файл временный, патч невозможен)
+
+Общее: Google-аккаунт (любой страны).
 
 ---
 
@@ -49,21 +51,24 @@ Google закрыл Antigravity для российских аккаунтов �
 
 **Шаг 1.** Скачай и установи Antigravity: https://antigravity.google/download
 
-> ⚠️ После установки **сразу запусти приложение один раз вручную** и закрой. Если скачал через браузер — Safari/Chrome ставят карантинный флаг, из-за которого macOS запускает приложение из временной read-only копии (App Translocation), и патч не попадает в настоящие файлы. Скрипт снимает карантин автоматически, но первый запуск лучше сделать после него.
+> ⚠️ **macOS:** после установки **сразу запусти приложение один раз вручную** и закрой. Если скачал через браузер — Safari/Chrome ставят карантинный флаг, из-за которого macOS запускает приложение из временной read-only копии (App Translocation), и патч не попадает в настоящие файлы. Скрипт снимает карантин автоматически, но первый запуск лучше сделать после него.
 
-**Шаг 2.** Скачай скрипт:
+**Шаг 2.** Скачай скрипт для своей платформы:
 
+```bash
+# macOS
+curl -sLO https://github.com/Asalio123/antigravity-unlocker/raw/main/macos/ag_unlocker_mac.sh
+# Linux
+curl -sLO https://github.com/Asalio123/antigravity-unlocker/raw/main/linux/ag_unlocker_linux.sh
 ```
-curl -sL -o ag_unlocker_mac.sh https://github.com/Asalio123/antigravity-unlocker-mac/raw/main/ag_unlocker_mac.sh
-```
 
-или просто скачай файл `ag_unlocker_mac.sh` из этого репозитория кнопкой **Code → Download ZIP**.
+или скачай нужный файл из этого репозитория кнопкой **Code → Download ZIP**.
 
 **Шаг 3.** Запусти:
 
 ```bash
-sudo bash ag_unlocker_mac.sh          # macOS
-sudo bash linux/ag_unlocker_linux.sh  # Linux
+sudo bash ag_unlocker_mac.sh    # macOS
+sudo bash ag_unlocker_linux.sh  # Linux
 ```
 
 > macOS: скрипт просит права администратора, потому что пишет в `/Applications` и `/etc/hosts`.
@@ -174,9 +179,9 @@ Google выпустили обновление, в котором изменил
 
 | Версия Antigravity | Платформа | Статус |
 |---|---|---|
+| 2.11.0 | Linux x86_64 (.deb) | ✅ патч верифицирован (строки, размер, обратимость); GUI-прогон — по фидбеку |
 | 2.11.0 | macOS arm64 | ✅ полная проверка |
 | 2.10.0 | macOS arm64 | ✅ полная проверка |
-| 2.11.0 | Linux x86_64 (.deb) | ✅ патч верифицирован (строки, размер, обратимость); GUI-прогон — по фидбеку |
 
 Механизм версии-независимый: если строка `ineligible` в бинаре есть — патч сработает. Нет — скрипт честно скажет «новая сборка» и ничего не тронет.
 
