@@ -3,6 +3,9 @@
 #  AG Unlocker for macOS  —  порт confeden/Antigravity (Windows) на macOS
 #  https://github.com/confeden/Antigravity
 #
+#  Цель: Google Antigravity (Desktop-приложение с antigravity.google/download).
+#  Standalone "Antigravity IDE" с той же страницы не тестировался.
+#
 #  Повторяет методы оригинала 1-в-1:
 #    1) Байтовый патч: строка "ineligible" -> "inexigible" (обе по 10 байт,
 #       размер файла не меняется, обратимо) в Language Server / agy.
@@ -101,7 +104,7 @@ check_arch() {
   # v2.4+: dist/main.js внутри app.asar содержит ./languageServer + ./ipcHandlers
   # и НЕ содержит legacy-auth маркеров (patch_ide.rs: is_new_desktop_architecture)
   local asar="$1/Contents/Resources/app.asar"
-  [ -f "$asar" ] || { info "app.asar не найден (мб standalone IDE) — пропускаю проверку архитектуры"; return 0; }
+  [ -f "$asar" ] || { info "app.asar не найден (возможно, standalone IDE) — пропускаю проверку архитектуры"; return 0; }
   # grep -c при 0 совпадений даёт exit 1 — поэтому без "|| echo 0"
   local modular legacy
   modular=$(grep -ac "./languageServer" "$asar" 2>/dev/null); [ -z "$modular" ] && modular=0
@@ -316,7 +319,7 @@ while true; do
   say " 2) Только патч бинарей (для режима с VPN)"
   say " 3) Обновить DNS-пин (без VPN!)"
   say " 4) Статус / диагностика"
-  say " 7) Полный откат (снять патч и вернуть всё как было)"
+  say " 5) Полный откат (снять патч и вернуть всё как было)"
   say " 0) Выход"
   printf "Выбор: "
   read -r choice || { say ""; exit 0; }
@@ -327,10 +330,10 @@ while true; do
        kill_processes; patch_binaries "$APP" ;;
     3) dns_pin ;;
     4) show_status ;;
-    7) [ -n "$APP" ] && { kill_processes; unpatch_binaries "$APP"; }
+    5) [ -n "$APP" ] && { kill_processes; unpatch_binaries "$APP"; }
        remove_hosts_block
        ok "Полный откат завершён." ;;
     0) exit 0 ;;
-    *) warn "не понял" ;;
+    *) warn "Неизвестный пункт меню" ;;
   esac
 done
