@@ -162,8 +162,24 @@ unpatch_binaries() {
 }
 
 # ---------------------------------------------------------------- DNS pin
+DIG_OPT=""
+# если UDP/53 наружу закрыт (VM/корпоративные сети), но TCP работает — переключаемся на DNS over TCP
+detect_dns_transport() {
+  if [ -z "$(dig +short +time=3 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
+    if [ -n "$(dig +short +tcp +time=3 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
+      DIG_OPT="+tcp"
+      info "UDP/53 недоступен — использую DNS over TCP"
+    fi
+  fi
+}
+
 dig_a() {
-  dig +short +time=5 +tries=2 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u
+  local out
+  out=$(dig $DIG_OPT +short +time=4 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
+  if [ -z "$out" ]; then
+    out=$(dig +tcp +short +time=4 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
+  fi
+  echo "$out"
 }
 
 ref_net16() {
@@ -183,6 +199,7 @@ tcp_alive() {
 
 dns_pin() {
   local domain ip prov all_substituted=1
+  detect_dns_transport
   PIN_MAP=""
   for domain in "${DOMAINS[@]}"; do
     local ref_blocks
