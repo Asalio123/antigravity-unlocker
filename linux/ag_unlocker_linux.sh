@@ -4,12 +4,17 @@
 #  https://github.com/confeden/Antigravity
 #  Собрат скрипта antigravity-unlocker-mac: те же методы, та же DNS-часть.
 #
-#  Цель: Google Antigravity (Desktop), установленный из .deb/.rpm.
+#  Цель: Google Antigravity (Desktop) и Antigravity IDE с antigravity.google/download.
 #  В AppImage-версии патч бессмысленный (файл временный) — не поддерживается.
 #
 #  Как работает (коротко):
 #    1) Байтовый патч: "ineligible" -> "inexigible" (по 10 байт, обратимо)
 #       в Language Server — клиент перестаёт распознавать отказ eligibility.
+#       Desktop v2.4+ этим и ограничивается (auth целиком в Language Server).
+#    1б) IDE дополнительно: перезапись auth-функции в resources/app/out/main.js
+#       (regex по минифицированному телу, порт patch_ide.rs оригинала 1-в-1)
+#       + fallback имени в extensions/antigravity/dist/extension.js.
+#       Перед первой правкой делается бэкап <файл>.ag_backup, откат = restore из него.
 #    2) DNS-пин: анблок-DNS (xbox-dns.ru / comss.one / geohide.ru) отдают
 #       российским клиентам IP своих SNI-прокси вместо Google; рабочие
 #       адреса пинуются в /etc/hosts (маркеры AG_UNLOCKER_HOSTS_*).
@@ -29,6 +34,9 @@ HOSTS="${AG_HOSTS:-/etc/hosts}"
 DOMAINS=(
   "daily-cloudcode-pa.googleapis.com"
   "generativelanguage.googleapis.com"
+  # endpoint IDE (confeden 2.11+: оверрайд эндпоинта убран, подменяющий провайдер есть в пуле).
+  # Если подмены нет — домен просто не пинуется, остальные не страдают.
+  "cloudcode-pa.googleapis.com"
 )
 PROVIDERS=(45.155.204.190 37.230.192.51 111.88.96.50 111.88.96.51 83.220.169.155 212.109.195.93 195.133.25.16)
 REFERENCE=(8.8.8.8 1.1.1.1)
@@ -53,6 +61,7 @@ if ! command -v dig >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------- app discovery
+# INSTALLS — пути к resources-директориям (Desktop и IDE могут стоять одновременно).
 # Порядок: пакетный менеджер -> find по стандартным корням.
 find_installs() {
   INSTALLS=()
@@ -63,20 +72,39 @@ find_installs() {
     return 0
   fi
   if command -v dpkg >/dev/null 2>&1; then
-    found=$(dpkg -L antigravity 2>/dev/null | grep -E 'bin/language_server$')
+    found=$(dpkg -L antigravity antigravity-ide 2>/dev/null | grep -E 'bin/language_server(_linux_x64)?$')
   fi
-  if [ -z "$found" ] && command -v rpm >/dev/null 2>&1; then
-    found=$(rpm -ql antigravity 2>/dev/null | grep -E 'bin/language_server$')
+  if command -v rpm >/dev/null 2>&1; then
+    found="$found
+$(rpm -ql antigravity antigravity-ide 2>/dev/null | grep -E 'bin/language_server(_linux_x64)?$')"
   fi
-  if [ -z "$found" ]; then
-    found=$(find /opt /usr/share /usr/lib "$HOME/.antigravity" "$HOME/opt" \
-             -maxdepth 5 -type f -path "*ntigravity*" -name "language_server" 2>/dev/null | grep -v AppImage)
-  fi
+  # Desktop: resources/bin/language_server; tar.gz-установки живут где угодно
+  # (суффикс платформы в имени LS может дрейфовать — как и у оригинала, берём language_server*)
+  found="$found
+$(find /opt /usr/share /usr/lib /usr/local/share "$HOME/.antigravity" "$HOME/opt" "$HOME" \
+       -maxdepth 6 -type f -path "*ntigravity*" -name "language_server*" 2>/dev/null | grep -v AppImage)"
+  # IDE: language_server лежит глубже (resources/app/extensions/...), надёжнее искать
+  # по out/main.js — он есть только у IDE (у Desktop JS живёт в app.asar/dist)
+  found="$found
+$(find /opt /usr/share /usr/lib /usr/local/share "$HOME/.local/share" "$HOME" \
+       -maxdepth 6 -type f -path "*ntigravity*" -regex ".*/resources/app/out/main\.js" 2>/dev/null)"
   for p in $found; do
     local root
-    root=$(dirname "$(dirname "$p")")   # .../resources
-    INSTALLS+=("$root")
+    case "$p" in
+      */resources/app/out/main.js)                root=$(dirname "$(dirname "$(dirname "$p")")") ;;  # IDE по main.js
+      */resources/app/extensions/antigravity/bin/*)
+        root=$(dirname "$(dirname "$(dirname "$(dirname "$(dirname "$p")")")")") ;;                    # IDE по LS
+      *) root=$(dirname "$(dirname "$p")") ;;                                                          # Desktop LS
+    esac
+    [ -d "$root" ] && INSTALLS+=("$root")
   done
+  # дедуп (desktop может найтись и через пакетник, и через find)
+  if [ ${#INSTALLS[@]} -gt 1 ]; then
+    local u
+    u=$(printf '%s\n' "${INSTALLS[@]}" | sort -u)
+    INSTALLS=()
+    while IFS= read -r p; do [ -n "$p" ] && INSTALLS+=("$p"); done <<< "$u"
+  fi
 }
 
 # Патч-цели установки: language_server (+ agy из PATH, если вдруг есть).
@@ -111,6 +139,7 @@ check_arch() {
 }
 
 kill_processes() {
+  [ -n "$AG_NO_ELEVATE" ] && return 0   # dev/CI-режим: чужие процессы не трогаем
   pkill -if "antigravity" 2>/dev/null
   pkill -if "language_server" 2>/dev/null
   pkill -if "agy" 2>/dev/null
@@ -159,6 +188,200 @@ unpatch_binaries() {
     total=$((total+1))
   done
   [ "$total" -eq 0 ] && info "Пропатченных бинарей не найдено."
+}
+
+# ---------------------------------------------------------------- IDE JS patch
+# Порт patch_ide.rs оригинала 1-в-1. Только у IDE auth частично живёт в JS:
+# перезаписывается тело auth-функции в resources/app/out/main.js (regex по
+# минифицированному коду, имена переменных параметризованы) и fallback имени в
+# extensions/antigravity/dist/extension.js. Бэкап <файл>.ag_backup создаётся
+# один раз ДО первой правки — откат возможен только из него (тело перезаписано,
+# из пропатченных байт оригинал не восстановить).
+JS_PATCHER=""
+ensure_js_patcher() {
+  [ -n "$JS_PATCHER" ] && return 0
+  JS_PATCHER="${TMPDIR:-/tmp}/.ag_ide_js.$$.pl"
+  cat > "$JS_PATCHER" <<'PERLEOF'
+#!/usr/bin/perl
+# режимы: main|ext|revert <file>
+# exit: 0 patched/restored, 2 already/nothing, 3 old patch (нужна переустановка),
+#       4 signature not found, 1 io error
+use strict;
+use warnings;
+my ($mode, $file) = @ARGV;
+die "usage: $0 main|ext|revert <file>\n" unless $mode && $file;
+sub slurp {
+    my ($f) = @_;
+    open my $fh, '<', $f or die "не прочитать $f: $!";
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+sub backup_once {
+    my ($f) = @_;
+    my $bak = "$f.ag_backup";
+    return if -e $bak;
+    require File::Copy;
+    File::Copy::copy($f, $bak) or warn "бэкап $bak не создан: $!";
+}
+sub write_atomic {
+    my ($f, $content) = @_;
+    my $tmp = "$f.$$.agtmp";
+    open my $out, '>', $tmp or die "не записать $tmp: $!";
+    print $out $content;
+    close $out;
+    rename($tmp, $f) or do { unlink $tmp; die "rename $tmp -> $f: $!"; };
+}
+sub has_marker {
+    my ($c) = @_;
+    $c =~ s/\s+$//;
+    my ($last) = $c =~ /([^\n]*)$/;
+    return $last =~ /^\s*\/\/ UNLOCKED/;
+}
+if ($mode eq 'revert') {
+    my $bak = "$file.ag_backup";
+    if (-e $bak) {
+        my $c = slurp($bak);
+        write_atomic($file, $c);
+        unlink $bak;
+        print "RESTORED\n";
+        exit 0;
+    }
+    exit 2 unless -r $file;
+    my $c = slurp($file);
+    if (has_marker($c)) {
+        $c =~ s/\s+$//;
+        $c =~ s/\n?[ \t]*\/\/ UNLOCKED[^\n]*$//;
+        $c =~ s/^\/\*\[AG_EXT_PATCHED\]\*\/\n//;
+        write_atomic($file, "$c\n");
+        warn "бэкап отсутствует — снят только маркер, тело патча осталось\n";
+        print "STRIPPED\n";
+        exit 0;
+    }
+    exit 2;
+}
+my $content = slurp($file);
+if ($mode eq 'main') {
+    if (index($content, '/*[AG_PATCHED]*/') >= 0 || index($content, '[AG_PROXY_HOOK]') >= 0) {
+        print STDERR "старая версия патча — нужна чистая переустановка IDE\n";
+        exit 3;
+    }
+    exit 2 if has_marker($content);
+    my $re = qr/async\s+([A-Za-z_\$0-9]+)\(([A-Za-z_\$0-9]+)\)\s*\{\s*if\(this\.([A-Za-z_\$0-9]+)\.send\(\{type:[A-Za-z_\$0-9]+\.isGcpTos\?"GCP_SIGN_IN":"SIGN_IN"\}\),this\.([A-Za-z_\$0-9]+)\.resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal\)\{try\{await this\.([A-Za-z_\$0-9]+)\.loadCodeAssist\([A-Za-z_\$0-9]+\);const\{settings:([A-Za-z_\$0-9]+),userTier:([A-Za-z_\$0-9]+)\}=await this\.refreshUserStatus\([A-Za-z_\$0-9]+\),([A-Za-z_\$0-9]+)=([A-Za-z_\$0-9]+)\([A-Za-z_\$0-9]+\);this\.([A-Za-z_\$0-9]+)\.pushUpdate\([A-Za-z_\$0-9]+\),this\.[A-Za-z_\$0-9]+\.send\(\{type:"AUTH_SUCCESS",tokenInfo:[A-Za-z_\$0-9]+\}\),this\.([A-Za-z_\$0-9]+)\.fire\(\{settings:[A-Za-z_\$0-9]+,userTier:[A-Za-z_\$0-9]+\}\)\}catch\(([A-Za-z_\$0-9]+)\)\{.*?(?:return\}|return;\s*\})/;
+    unless ($content =~ /$re/) {
+        print STDERR "сигнатура не найдена\n";
+        exit 4;
+    }
+    my ($fname, $t, $send, $y, $i, $func, $f, $h) = ($1, $2, $3, $4, $8, $9, $10, $11);
+    my $payload = <<"EOP";
+async $fname($t){
+    this.$send.send({type:$t.isGcpTos?"GCP_SIGN_IN":"SIGN_IN"});
+    this.$y.resetIsTierGCPTos();
+    try {
+        try { await this.$y.loadCodeAssist($t); } catch(_) {}
+        try { await this.$y.onboardUser("standard-tier", $t); } catch(_) {
+            try { await this.$y.onboardUser("free-tier", $t); } catch(__) {}
+        }
+        let __res = { settings: {}, userTier: { id: "pro", description: "Pro" } };
+        try { __res = await this.refreshUserStatus($t); } catch(_) {}
+        const $i = $func($t);
+        try { this.$f.pushUpdate($i); } catch(_) {}
+        this.$send.send({type:"AUTH_SUCCESS",tokenInfo:$t});
+        this.$h.fire({settings:__res.settings, userTier:__res.userTier});
+    } catch(e) {}
+    return;
+EOP
+    my $new = substr($content, 0, $-[0]) . $payload . substr($content, $+[0]);
+    $new .= "// UNLOCKED\n";
+    backup_once($file);
+    write_atomic($file, $new);
+    print "PATCHED\n";
+    exit 0;
+}
+if ($mode eq 'ext') {
+    exit 2 if index($content, '/*[AG_EXT_PATCHED]*/') >= 0;
+    my $re = qr/const t=await ([A-Za-z_\$][A-Za-z_\$0-9.]*)\.UserStatus\.getUserStatus\(\);if\(!t\)return\[\];const n=\(0,([A-Za-z_\$][A-Za-z_\$0-9.]*)\)\(t,([A-Za-z_\$][A-Za-z_\$0-9.]*)\),\{email:([A-Za-z_\$][A-Za-z_\$0-9]*),name:([A-Za-z_\$][A-Za-z_\$0-9]*)\}=n;return""===([A-Za-z_\$][A-Za-z_\$0-9]*)\?\[\]:/;
+    unless ($content =~ /$re/) {
+        print STDERR "сигнатура extension.js не найдена\n";
+        exit 4;
+    }
+    my ($ns, $p2, $dz7, $email, $name) = ($1, $2, $3, $4, $5);
+    my $rep = "const t=await $ns.UserStatus.getUserStatus();let $email=\"\",$name=\"\";try{if(t){const n=(0,$p2)(t,$dz7);$email=n.email||\"\";$name=n.name||\"\";}}catch(_){}if($email===\"\"){$email=\"antigravity-user\";$name=\"User\";}return false?[]:";
+    $content = substr($content, 0, $-[0]) . $rep . substr($content, $+[0]);
+    $content = "/*[AG_EXT_PATCHED]*/\n$content\n// UNLOCKED\n";
+    backup_once($file);
+    write_atomic($file, $content);
+    print "PATCHED\n";
+    exit 0;
+}
+die "неизвестный режим: $mode\n";
+PERLEOF
+}
+
+# Применить JS-патчи IDE (если эта установка — IDE). Не IDE -> молча return 1.
+patch_ide_js() {
+  local RES="$1"
+  local main_js="$RES/app/out/main.js"
+  local ext_js="$RES/app/extensions/antigravity/dist/extension.js"
+  [ -f "$main_js" ] || return 1
+  ensure_js_patcher
+  local out rc
+  out=$(perl "$JS_PATCHER" main "$main_js" 2>&1); rc=$?
+  case $rc in
+    0)
+      # если есть node — верифицируем синтаксис; при поломке откатываем из бэкапа
+      if command -v node >/dev/null 2>&1 && ! node --check "$main_js" 2>/dev/null; then
+        perl "$JS_PATCHER" revert "$main_js" >/dev/null 2>&1
+        err "main.js после патча не парсится — откачен из бэкапа. Сообщи автору скрипта."
+        return 1
+      fi
+      ok "IDE: main.js пропатчен (auth-функция перезаписана)"
+      ;;
+    2) ok "IDE: main.js уже пропатчен" ;;
+    3) err "IDE: обнаружена старая версия патча в main.js — переустанови IDE чисто и повтори"; return 1 ;;
+    4) err "IDE: сигнатура main.js не найдена — новая версия IDE? JS не тронут"; return 1 ;;
+    *) err "IDE main.js: $out"; return 1 ;;
+  esac
+  # extension.js — косметика (fallback имени юзера), ошибка не фатальна (как у оригинала)
+  if [ -f "$ext_js" ]; then
+    out=$(perl "$JS_PATCHER" ext "$ext_js" 2>&1)
+    case $? in
+      0) ok "IDE: extension.js пропатчен" ;;
+      2) ok "IDE: extension.js уже пропатчен" ;;
+      *) info "IDE: extension.js пропущен ($out) — не критично" ;;
+    esac
+  fi
+  return 0
+}
+
+# Откат JS-правок IDE из .ag_backup (byte-exact).
+revert_ide_js() {
+  local RES="$1"
+  local main_js="$RES/app/out/main.js"
+  local ext_js="$RES/app/extensions/antigravity/dist/extension.js"
+  ensure_js_patcher
+  local f out rc
+  for f in "$main_js" "$ext_js"; do
+    [ -e "$f" ] || [ -e "$f.ag_backup" ] || continue
+    out=$(perl "$JS_PATCHER" revert "$f" 2>&1); rc=$?
+    case $rc in
+      0) ok "JS восстановлен из бэкапа: $f" ;;
+      2) : ;;  # нечего откатывать
+      *) warn "JS revert $f: $out" ;;
+    esac
+  done
+}
+
+# Полный патч одной установки: бинари + (для IDE) JS.
+patch_install() {
+  local RES="$1"; local rc=0
+  info "=== Установка: $RES"
+  patch_binaries "$RES" || rc=1
+  if [ -f "$RES/app/out/main.js" ]; then
+    patch_ide_js "$RES" || rc=1
+  fi
+  return $rc
 }
 
 # ---------------------------------------------------------------- DNS pin
@@ -287,7 +510,17 @@ show_status() {
   local RES
   for RES in "${INSTALLS[@]}"; do
     info "Установка: $RES"
-    check_arch "$RES"
+    if [ -f "$RES/app/out/main.js" ]; then
+      say "    продукт: Antigravity IDE"
+      if tail -c 200 "$RES/app/out/main.js" | grep -q "^// UNLOCKED"; then
+        ok "IDE main.js: пропатчен"
+      else
+        warn "IDE main.js: НЕ пропатчен"
+      fi
+    else
+      say "    продукт: Antigravity Desktop"
+      check_arch "$RES"
+    fi
     collect_targets "$RES"
     local f in_cnt out_cnt
     for f in "${TARGETS[@]}"; do
@@ -311,19 +544,22 @@ show_status() {
 }
 
 # ---------------------------------------------------------------- menu / main
+trap '[ -n "$JS_PATCHER" ] && rm -f "$JS_PATCHER" 2>/dev/null' EXIT
+
 find_installs
 if [ ${#INSTALLS[@]} -gt 0 ]; then
-  say "Найдено установок: ${#INSTALLS[@]} (${INSTALLS[0]}...)"
+  say "Найдено установок: ${#INSTALLS[@]}"
+  printf '  - %s\n' "${INSTALLS[@]}"
 else
-  warn "Antigravity не найден. Установи .deb/.rpm с https://antigravity.google/download и перезапусти скрипт."
-  warn "В AppImage-версии патч невозможен (файл временный) — используй .deb/.rpm."
+  warn "Antigravity не найден. Установи .deb/.rpm или распакуй tar.gz с https://antigravity.google/download и перезапусти скрипт."
+  warn "В AppImage-версии патч невозможен (файл временный) — используй .deb/.rpm/tar.gz."
 fi
 
 while true; do
   say ""
   say "===== Antigravity анлокер для Linux ====="
-  say " 1) Разблокировать (патч бинарей + DNS-пин)"
-  say " 2) Только патч бинарей (для режима с VPN)"
+  say " 1) Разблокировать (патч + DNS-пин, все найденные установки)"
+  say " 2) Только патч (для режима с VPN)"
   say " 3) Обновить DNS-пин (без VPN!)"
   say " 4) Статус / диагностика"
   say " 5) Полный откат (снять патч и вернуть всё как было)"
@@ -332,12 +568,15 @@ while true; do
   read -r choice || { say ""; exit 0; }
   case "$choice" in
     1) [ ${#INSTALLS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
-       kill_processes; patch_binaries "${INSTALLS[0]}"; dns_pin ;;
+       kill_processes
+       for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done
+       dns_pin ;;
     2) [ ${#INSTALLS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
-       kill_processes; patch_binaries "${INSTALLS[0]}" ;;
+       kill_processes
+       for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done ;;
     3) dns_pin ;;
     4) show_status ;;
-    5) for RES in "${INSTALLS[@]}"; do kill_processes; unpatch_binaries "$RES"; done
+    5) for RES in "${INSTALLS[@]}"; do kill_processes; unpatch_binaries "$RES"; revert_ide_js "$RES"; done
        remove_hosts_block
        ok "Полный откат завершён." ;;
     0) exit 0 ;;
