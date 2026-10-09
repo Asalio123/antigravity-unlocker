@@ -15,13 +15,14 @@
 #       (regex по минифицированному телу, порт patch_ide.rs оригинала 1-в-1)
 #       + fallback имени в extensions/antigravity/dist/extension.js.
 #       Перед первой правкой делается бэкап <файл>.ag_backup, откат = restore из него.
-#    2) DNS-пин: анблок-DNS (xbox-dns.ru / comss.one / geohide.ru) отдают
-#       российским клиентам IP своих SNI-прокси вместо Google; рабочие
+#    2) DNS-пин: анблок-DNS (geohide.ru / comss.one / dns-ai.ru; UDP + DoH)
+#       отдают российским клиентам IP своих SNI-прокси вместо Google; живые
 #       адреса пинуются в /etc/hosts (маркеры AG_UNLOCKER_HOSTS_*).
 #       Ответ провайдера считается подменой, если его /16-подсеть отличается
-#       от эталонной (8.8.8.8 / 1.1.1.1). Пиновать ТОЛЬКО с выключенным VPN.
+#       от эталонной (8.8.8.8 / 1.1.1.1). DoH идёт мимо VPN-туннеля —
+#       выключать VPN не нужно. Watchdog (пункт 6) авторепатчит после обновлений.
 #
-#  Зависимости: bash, perl, dig (dnsutils), coreutils. На Linux подписи
+#  Зависимости: bash, perl, dig (dnsutils), curl, coreutils. На Linux подписи
 #  не проверяются — переподписка не нужна (в отличие от macOS-версии).
 #
 #  Запуск:  sudo bash ag_unlocker_linux.sh
@@ -38,7 +39,15 @@ DOMAINS=(
   # Если подмены нет — домен просто не пинуется, остальные не страдают.
   "cloudcode-pa.googleapis.com"
 )
-PROVIDERS=(45.155.204.190 37.230.192.51 111.88.96.50 111.88.96.51 83.220.169.155 212.109.195.93 195.133.25.16)
+# xbox-dns.ru выкинут: с 07.10.2026 сервис мёртв (РКН добился блокировки у хостера).
+# Остались geohide/comss (UDP) + DoH-эндпоинты тех же сервисов и dns-ai.ru
+# (DoH-only, HTTP/2; IP захардкожены — сертификат по имени защищает при протухшем IP).
+PROVIDERS=(45.155.204.190 37.230.192.51 83.220.169.155 212.109.195.93 195.133.25.16)
+DOH_PROVIDERS=(
+  "dns.geohide.ru|37.230.192.51,45.155.204.190|h1"
+  "dns.comss.one|83.220.169.155,212.109.195.93,195.133.25.16|h1"
+  "dns.dns-ai.ru|192.144.59.14,186.246.49.127,185.251.90.181|h2"
+)
 REFERENCE=(8.8.8.8 1.1.1.1)
 
 C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'; C_N='\033[0m'
@@ -49,6 +58,10 @@ err()  { say "${C_ERR}[X]${C_N} $1"; }
 info() { say "${C_INFO}[i]${C_N} $1"; }
 
 # ---------------------------------------------------------------- sudo gate
+# --watch: фоновый режим watchdog (из systemd --user) — без меню и без sudo
+if [ "$1" = "--watch" ]; then
+  AG_NO_ELEVATE=1
+fi
 # AG_NO_ELEVATE=1 — dev/CI-режим: не поднимать права
 if [ "$(id -u)" -ne 0 ] && [ -z "$AG_NO_ELEVATE" ]; then
   info "Нужен root (патч бинарей + запись /etc/hosts). Перезапуск через sudo..."
@@ -197,11 +210,11 @@ unpatch_binaries() {
 # extensions/antigravity/dist/extension.js. Бэкап <файл>.ag_backup создаётся
 # один раз ДО первой правки — откат возможен только из него (тело перезаписано,
 # из пропатченных байт оригинал не восстановить).
-JS_PATCHER=""
-ensure_js_patcher() {
-  [ -n "$JS_PATCHER" ] && return 0
-  JS_PATCHER="${TMPDIR:-/tmp}/.ag_ide_js.$$.pl"
-  cat > "$JS_PATCHER" <<'PERLEOF'
+HELPER=""
+ensure_helper() {
+  [ -n "$HELPER" ] && return 0
+  HELPER="${TMPDIR:-/tmp}/.ag_ide_js.$$.pl"
+  cat > "$HELPER" <<'PERLEOF'
 #!/usr/bin/perl
 # режимы: main|ext|revert <file>
 # exit: 0 patched/restored, 2 already/nothing, 3 old patch (нужна переустановка),
@@ -209,10 +222,49 @@ ensure_js_patcher() {
 use strict;
 use warnings;
 my ($mode, $file) = @ARGV;
-die "usage: $0 main|ext|revert <file>\n" unless $mode && $file;
+die "usage: $0 main|ext|revert|query|parse <file>\n" unless $mode && $file;
+if ($mode eq 'query') {
+    # base64url DNS wire query (A-запись) для DoH ?dns=
+    require MIME::Base64;
+    my $q = pack("n6", 0x1234, 0x0100, 1, 0, 0, 0);
+    $q .= join("", map { pack("C", length($_)) . $_ } split(/\./, $file)) . "\0";
+    $q .= pack("n2", 1, 1);
+    (my $b = MIME::Base64::encode_base64($q, '')) =~ tr{+/}{-_};
+    $b =~ s/=+$//;
+    print $b;
+    exit 0;
+}
+if ($mode eq 'parse') {
+    # A-записи из DNS wire ответа, по одной на строку
+    open my $fh, '<:raw', $file or exit 1;
+    local $/; my $d = <$fh>; close $fh;
+    my (undef, undef, $qd, $an) = unpack("n4", $d);
+    my $off = 12;
+    for (1..$qd) {
+        while (1) { my $l = unpack("C", substr($d,$off,1)); $off++;
+            last if $l == 0; if ($l >= 192) { $off++; last; } $off += $l; }
+        $off += 4;
+    }
+    for (1..$an) {
+        while (1) { my $l = unpack("C", substr($d,$off,1)); $off++;
+            last if $l == 0; if ($l >= 192) { $off++; last; } $off += $l; }
+        my ($type, undef, undef, $rdlen) = unpack("nnNn", substr($d,$off,10)); $off += 10;
+        print join(".", unpack("C4", substr($d,$off,4))), "\n" if $type == 1 && $rdlen == 4;
+        $off += $rdlen;
+    }
+    exit 0;
+}
 sub slurp {
     my ($f) = @_;
     open my $fh, '<', $f or die "не прочитать $f: $!";
+    local $/;
+    my $c = <$fh>;
+    close $fh;
+    return $c;
+}
+sub slurp_bin {
+    my ($f) = @_;
+    open my $fh, '<:raw', $f or die "не прочитать $f: $!";
     local $/;
     my $c = <$fh>;
     close $fh;
@@ -260,6 +312,24 @@ if ($mode eq 'revert') {
         exit 0;
     }
     exit 2;
+}
+if ($mode eq 'bpatch') {
+    # байтовый патч бинаря через temp+rename: работает по живому процессу (ETXTBSY-safe)
+    my $data = slurp_bin($file);
+    my $in = () = $data =~ /ineligible/g;
+    my $outc = () = $data =~ /inexigible/g;
+    exit 2 if $in == 0 && $outc > 0;   # уже пропатчен
+    exit 4 if $in == 0;                # сигнатуры нет — новая сборка
+    $data =~ s/ineligible/inexigible/g;
+    my $tmp = "$file.$$.agtmp";
+    open my $out, '>:raw', $tmp or exit 1;
+    print $out $data;
+    close $out;
+    my (undef, undef, $modebits) = stat($file);
+    chmod($modebits & 07777, $tmp);
+    rename($tmp, $file) or do { unlink $tmp; exit 1; };
+    print "$in\n";
+    exit 0;
 }
 my $content = slurp($file);
 if ($mode eq 'main') {
@@ -325,14 +395,14 @@ patch_ide_js() {
   local main_js="$RES/app/out/main.js"
   local ext_js="$RES/app/extensions/antigravity/dist/extension.js"
   [ -f "$main_js" ] || return 1
-  ensure_js_patcher
+  ensure_helper
   local out rc
-  out=$(perl "$JS_PATCHER" main "$main_js" 2>&1); rc=$?
+  out=$(perl "$HELPER" main "$main_js" 2>&1); rc=$?
   case $rc in
     0)
       # если есть node — верифицируем синтаксис; при поломке откатываем из бэкапа
       if command -v node >/dev/null 2>&1 && ! node --check "$main_js" 2>/dev/null; then
-        perl "$JS_PATCHER" revert "$main_js" >/dev/null 2>&1
+        perl "$HELPER" revert "$main_js" >/dev/null 2>&1
         err "main.js после патча не парсится — откачен из бэкапа. Сообщи автору скрипта."
         return 1
       fi
@@ -345,7 +415,7 @@ patch_ide_js() {
   esac
   # extension.js — косметика (fallback имени юзера), ошибка не фатальна (как у оригинала)
   if [ -f "$ext_js" ]; then
-    out=$(perl "$JS_PATCHER" ext "$ext_js" 2>&1)
+    out=$(perl "$HELPER" ext "$ext_js" 2>&1)
     case $? in
       0) ok "IDE: extension.js пропатчен" ;;
       2) ok "IDE: extension.js уже пропатчен" ;;
@@ -360,11 +430,11 @@ revert_ide_js() {
   local RES="$1"
   local main_js="$RES/app/out/main.js"
   local ext_js="$RES/app/extensions/antigravity/dist/extension.js"
-  ensure_js_patcher
+  ensure_helper
   local f out rc
   for f in "$main_js" "$ext_js"; do
     [ -e "$f" ] || [ -e "$f.ag_backup" ] || continue
-    out=$(perl "$JS_PATCHER" revert "$f" 2>&1); rc=$?
+    out=$(perl "$HELPER" revert "$f" 2>&1); rc=$?
     case $rc in
       0) ok "JS восстановлен из бэкапа: $f" ;;
       2) : ;;  # нечего откатывать
@@ -410,59 +480,116 @@ ref_net16() {
   for r in "${REFERENCE[@]}"; do dig_a "$1" "$r"; done | cut -d. -f1,2 | sort -u
 }
 
-# liveness: nc если есть, иначе bash /dev/tcp (есть на любом дистрибутиве)
-tcp_alive() {
-  if command -v nc >/dev/null 2>&1; then
-    nc -z -w 3 "$1" 443 >/dev/null 2>&1 && return 0
-  else
-    (timeout 3 bash -c "exec 3<>/dev/tcp/$1/443") 2>/dev/null && return 0
-  fi
+# --- обход VPN для DoH-запросов: бинд на физический интерфейс (root есть)
+VPN_ON=0; CURL_IF=""
+phys_iface() {
+  ip route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap|utun)' | head -1 \
+    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+setup_curl_bypass() {
+  VPN_ON=0; CURL_IF=""
+  ip route show default 2>/dev/null | grep -qE 'dev (tun|wg|tap)' || return 0
+  VPN_ON=1
+  local dev; dev=$(phys_iface)
+  [ -n "$dev" ] && CURL_IF="--interface $dev"
+  info "VPN активен — DoH-запросы пойдут мимо туннеля${dev:+ через $dev} (подмену отдают только RU-клиентам)"
+}
+
+# DoH A-запрос к одному провайдеру ("host|ip1,ip2|h1|h2") -> IPv4 построчно
+doh_a_one() {
+  ensure_helper
+  local dom="$1" spec="$2"
+  local host="${spec%%|*}" rest="${spec#*|}"
+  local ips="${rest%%|*}" proto="${rest##*|}"
+  local h2=""; [ "$proto" = "h2" ] && h2="--http2"
+  local b64 ip out tmp="${TMPDIR:-/tmp}/.ag_doh.$$"
+  b64=$(perl "$HELPER" query "$dom") || return 1
+  for ip in ${ips//,/ }; do
+    if curl -s $CURL_IF $h2 --max-time 6 --resolve "$host:443:$ip" \
+         "https://$host/dns-query?dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+      out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
+      if [ -n "$out" ]; then rm -f "$tmp"; echo "$out"; return 0; fi
+    fi
+  done
+  rm -f "$tmp"
+  return 1
+}
+
+# боевая проба: живой Google-ответ через кандидата (а не просто открытый порт)
+probe_ip() { # $1=domain $2=ip -> stdout: latency; exit 0 если жив
+  local out code
+  out=$(curl -s --max-time 6 --resolve "$1:443:$2" "https://$1/" -o /dev/null -w '%{http_code} %{time_total}' 2>/dev/null) || return 1
+  code="${out%% *}"
+  case "$code" in
+    2*|3*|4*) echo "${out##* }"; return 0 ;;
+  esac
   return 1
 }
 
 dns_pin() {
-  local domain ip prov all_substituted=1
+  # PIN_MAP — "domain:ip1,ip2|..." — IP пинуются строго per-domain.
+  # Кандидаты: UDP + DoH (с обходом туннеля при активном VPN). Перед пином —
+  # боевая HTTPS-проба каждого; пинуются до 2 быстрейших.
+  local domain ip prov spec
   detect_dns_transport
+  setup_curl_bypass
   PIN_MAP=""
+  local any_substituted=0
   for domain in "${DOMAINS[@]}"; do
     local ref_blocks
     ref_blocks=$(ref_net16 "$domain")
     [ -z "$ref_blocks" ] && { warn "эталон не ответил для $domain — пропуск"; continue; }
-    local dom_ips=""
+    local cand=""
     for prov in "${PROVIDERS[@]}"; do
-      local ans is_sub=0 sub_list=""
-      ans=$(dig_a "$domain" "$prov") || continue
-      [ -z "$ans" ] && continue
+      local ans; ans=$(dig_a "$domain" "$prov"); [ -z "$ans" ] && continue
+      local sub=""
       while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        local b16="${ip%.*.*}"
-        if echo "$ref_blocks" | grep -qx "$b16"; then continue; fi
-        is_sub=1
-        sub_list=$(echo "$sub_list"$'\n'"$ip" | sort -u | sed '/^$/d')
+        echo "$ref_blocks" | grep -qx "${ip%.*.*}" || sub="$sub $ip"
       done <<< "$ans"
-      if [ "$is_sub" -eq 1 ]; then
-        all_substituted=0
-        info "$domain @ $prov -> подмена: $(echo $sub_list)"
-        dom_ips=$(echo "$dom_ips"$'\n'"$sub_list" | sort -u | sed '/^$/d')
-      else
-        info "$domain @ $prov -> честный Google (passthrough)"
+      if [ -n "$sub" ]; then
+        any_substituted=1
+        info "$domain @ $prov -> подмена:$(echo $sub | tr ' ' ',')"
+        cand="$cand $sub"
       fi
     done
-    local dom_live=""
-    for ip in $dom_ips; do
-      if tcp_alive "$ip"; then
-        dom_live=$(echo "$dom_live"$'\n'"$ip" | sort -u | sed '/^$/d')
-      else
-        warn "$ip:443 не отвечает — не пиную"
+    for spec in "${DOH_PROVIDERS[@]}"; do
+      local ans; ans=$(doh_a_one "$domain" "$spec"); [ -z "$ans" ] && continue
+      local sub=""
+      while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        echo "$ref_blocks" | grep -qx "${ip%.*.*}" || sub="$sub $ip"
+      done <<< "$ans"
+      if [ -n "$sub" ]; then
+        any_substituted=1
+        info "$domain @ ${spec%%|*} (DoH) -> подмена:$(echo $sub | tr ' ' ',')"
+        cand="$cand $sub"
       fi
     done
-    PIN_MAP="$PIN_MAP$domain:$(echo $dom_live | tr ' ' ',')|"
+    cand=$(echo $cand | tr ' ' '\n' | sed '/^$/d' | sort -u)
+    if [ -z "$cand" ]; then
+      warn "$domain: подмены нет ни у одного провайдера — домен не пиную"
+      continue
+    fi
+    local scored=""
+    while IFS= read -r ip; do
+      [ -z "$ip" ] && continue
+      local t
+      if t=$(probe_ip "$domain" "$ip"); then
+        scored="$scored$t $ip\n"
+      else
+        warn "$ip: боевая проба не прошла — не пиную"
+      fi
+    done <<< "$cand"
+    local top
+    top=$(printf '%b' "$scored" | sort -n | head -2 | awk '{print $2}')
+    [ -n "$top" ] && PIN_MAP="$PIN_MAP$domain:$(echo $top | tr ' ' ',')|"
   done
 
-  if [ "$all_substituted" -eq 1 ] || [ -z "$(echo "$PIN_MAP" | tr -d ':|')" ]; then
-    err "Ни один провайдер не отдал подменённые адреса."
-    warn "Чаще всего это значит: VPN включён, и провайдеры видят зарубежного клиента."
-    warn "Выключи свой VPN-клиент и повтори пункт 3."
+  if [ "$any_substituted" -eq 0 ] || [ -z "$(echo "$PIN_MAP" | tr -d ':|')" ]; then
+    err "Ни один провайдер не отдал подменённые адреса (UDP и DoH)."
+    warn "Варианты: ты не в регионе, для которого сервисы делают подмену, или все их узлы сейчас недоступны."
+    warn "Режим с VPN (пункт 2) от этого не зависит — там достаточно любого VPN с не-RU выходом."
     return 1
   fi
 
@@ -501,6 +628,130 @@ remove_hosts_block() {
   else
     info "hosts-блок не найден"
   fi
+}
+
+# ---------------------------------------------------------------- watchdog
+# Авто-репатч после обновлений (порт watchdog.rs оригинала): settle-правило
+# (size:mtime стабильны два тика), сигнатуры нет -> не трогаем до смены файла,
+# полный откат (пункт 5) выключает watchdog флагом-отказом.
+WATCH_LABEL="ag-unlocker-watch"
+WATCH_UNIT="$HOME/.config/systemd/user/$WATCH_LABEL.service"
+DECLINE_FLAG="$HOME/.ag_unlocker_no_watch"
+WATCH_STATE="${TMPDIR:-/tmp}/.ag_watch_state.$UID"
+WATCH_LOG="/tmp/ag_unlocker_watch.log"
+
+f_sig() { stat -c '%s:%Y' "$1" 2>/dev/null || echo absent; }
+state_name() { echo "$1" | md5sum | cut -d' ' -f1; }
+
+watch_loop() {
+  mkdir -p "$WATCH_STATE"
+  echo "$(date '+%F %T') watchdog стартанул (pid $$)" >> "$WATCH_LOG"
+  local tick=0
+  while true; do
+    if [ -f "$DECLINE_FLAG" ]; then
+      echo "$(date '+%F %T') decline-флаг — выход" >> "$WATCH_LOG"; exit 0
+    fi
+    find_installs
+    local targets="" RES f
+    for RES in "${INSTALLS[@]}"; do
+      for f in "$RES"/bin/language_server* \
+               "$RES"/app/extensions/antigravity/bin/language_server* \
+               "$RES/app/out/main.js" \
+               "$RES/app/extensions/antigravity/dist/extension.js"; do
+        [ -f "$f" ] && targets="$targets$f
+"
+      done
+    done
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      local cur st last pending
+      cur=$(f_sig "$f"); [ "$cur" = "absent" ] && continue
+      st="$WATCH_STATE/$(state_name "$f")"
+      last=""; pending=0
+      [ -f "$st" ] && { last=$(sed -n 1p "$st"); pending=$(sed -n 2p "$st"); }
+      if [ "$cur" != "$last" ]; then
+        printf '%s\n1\n' "$cur" > "$st"   # сменился — ждём второй тик (settle)
+        continue
+      fi
+      [ "$pending" = "1" ] || continue
+      ensure_helper
+      case "$f" in
+        *.js)
+          local mode="main"
+          case "$f" in *extension.js) mode="ext" ;; esac
+          local out rc
+          out=$(perl "$HELPER" "$mode" "$f" 2>&1); rc=$?
+          case $rc in
+            0) echo "$(date '+%F %T') repatch JS: $f" >> "$WATCH_LOG" ;;
+            2) : ;;
+            *) echo "$(date '+%F %T') JS $f: rc=$rc $out (жду смены файла)" >> "$WATCH_LOG" ;;
+          esac
+          ;;
+        *)
+          local n rc
+          n=$(perl "$HELPER" bpatch "$f" 2>/dev/null); rc=$?
+          case $rc in
+            0) echo "$(date '+%F %T') repatch bin ($n вхожд.): $f" >> "$WATCH_LOG" ;;
+            2) : ;;
+            *) echo "$(date '+%F %T') bin $f: нет сигнатуры/ошибка rc=$rc (жду смены файла)" >> "$WATCH_LOG" ;;
+          esac
+          ;;
+      esac
+      printf '%s\n0\n' "$cur" > "$st"
+    done <<< "$targets"
+    # рефреш hosts-пина раз в ~10 мин: пин есть, но все IP домена мертвы -> рефреш
+    tick=$((tick+1))
+    if [ $((tick % 300)) -eq 0 ] && grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
+      if [ -w "$HOSTS" ]; then
+        local need=0 domain ip alive
+        for domain in "${DOMAINS[@]}"; do
+          alive=0
+          for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk -v d="$domain" '$2==d {print $1}'); do
+            probe_ip "$domain" "$ip" >/dev/null 2>&1 && alive=1 && break
+          done
+          [ "$alive" = "0" ] && need=1
+        done
+        [ "$need" = "1" ] && { echo "$(date '+%F %T') пин протух — рефреш" >> "$WATCH_LOG"; dns_pin >> "$WATCH_LOG" 2>&1; }
+      else
+        echo "$(date '+%F %T') hosts недоступен на запись из watchdog — рефреш вручную (пункт 3)" >> "$WATCH_LOG"
+      fi
+    fi
+    sleep 2
+  done
+}
+
+install_watchdog() {
+  command -v systemctl >/dev/null 2>&1 || { err "systemd не найден — watchdog не ставится"; return 1; }
+  local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  rm -f "$DECLINE_FLAG"
+  mkdir -p "$HOME/.config/systemd/user"
+  cat > "$WATCH_UNIT" <<EOF
+[Unit]
+Description=Antigravity unlocker watchdog (auto-repatch)
+
+[Service]
+ExecStart=/bin/bash $self --watch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  if systemctl --user enable --now "$WATCH_LABEL.service" 2>/dev/null; then
+    ok "Watchdog установлен (systemd --user, Restart=always). Лог: $WATCH_LOG"
+    loginctl enable-linger "$USER" 2>/dev/null   # жить без активной сессии
+    info "После автообновления Antigravity патч восстановится сам через ~5 секунд."
+    info "Установка в /opt от root: репатч оттуда требует прав — watchdog напишет в лог."
+  else
+    err "systemctl --user не удался"; return 1
+  fi
+}
+
+uninstall_watchdog() {
+  systemctl --user disable --now "$WATCH_LABEL.service" 2>/dev/null && ok "Watchdog остановлен"
+  rm -f "$WATCH_UNIT"
+  systemctl --user daemon-reload 2>/dev/null
 }
 
 # ---------------------------------------------------------------- status
@@ -544,7 +795,9 @@ show_status() {
 }
 
 # ---------------------------------------------------------------- menu / main
-trap '[ -n "$JS_PATCHER" ] && rm -f "$JS_PATCHER" 2>/dev/null' EXIT
+[ "$1" = "--watch" ] && { watch_loop; exit 0; }
+
+trap '[ -n "$HELPER" ] && rm -f "$HELPER" 2>/dev/null' EXIT
 
 find_installs
 if [ ${#INSTALLS[@]} -gt 0 ]; then
@@ -560,9 +813,14 @@ while true; do
   say "===== Antigravity анлокер для Linux ====="
   say " 1) Разблокировать (патч + DNS-пин, все найденные установки)"
   say " 2) Только патч (для режима с VPN)"
-  say " 3) Обновить DNS-пин (без VPN!)"
+  say " 3) Обновить DNS-пин (работает и при включённом VPN)"
   say " 4) Статус / диагностика"
   say " 5) Полный откат (снять патч и вернуть всё как было)"
+  if [ -f "$WATCH_UNIT" ]; then
+    say " 6) Watchdog: ВКЛЮЧЁН (авто-репатч после обновлений) — выключить"
+  else
+    say " 6) Watchdog: выключен — включить авто-репатч после обновлений"
+  fi
   say " 0) Выход"
   printf "Выбор: "
   read -r choice || { say ""; exit 0; }
@@ -578,7 +836,14 @@ while true; do
     4) show_status ;;
     5) for RES in "${INSTALLS[@]}"; do kill_processes; unpatch_binaries "$RES"; revert_ide_js "$RES"; done
        remove_hosts_block
+       uninstall_watchdog
+       touch "$DECLINE_FLAG"
        ok "Полный откат завершён." ;;
+    6) if [ -f "$WATCH_UNIT" ]; then
+         uninstall_watchdog; touch "$DECLINE_FLAG"; ok "Watchdog выключен."
+       else
+         install_watchdog
+       fi ;;
     0) exit 0 ;;
     *) warn "Неизвестный пункт меню" ;;
   esac
