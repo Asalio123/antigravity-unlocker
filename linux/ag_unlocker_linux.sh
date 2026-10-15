@@ -84,6 +84,10 @@ find_installs() {
     INSTALLS+=("$AG_ROOT")
     return 0
   fi
+  # Antigravity CLI (`agy`) без Desktop/IDE: каталог с agy — сам по себе install root
+  local agy_bin
+  agy_bin=$(command -v agy 2>/dev/null)
+  [ -n "$agy_bin" ] && INSTALLS+=("$(dirname "$agy_bin")")
   if command -v dpkg >/dev/null 2>&1; then
     found=$(dpkg -L antigravity antigravity-ide 2>/dev/null | grep -E 'bin/language_server(_linux_x64)?$')
   fi
@@ -127,6 +131,7 @@ collect_targets() {
   local candidates=(
     "$RES/bin/language_server"
     "$RES/app/extensions/antigravity/bin/language_server"*
+    "$RES/agy"
   )
   local agy
   agy=$(command -v agy 2>/dev/null) && [ -n "$agy" ] && candidates+=("$agy")
@@ -834,7 +839,7 @@ if [ ${#INSTALLS[@]} -gt 0 ]; then
   say "Найдено установок: ${#INSTALLS[@]}"
   printf '  - %s\n' "${INSTALLS[@]}"
 else
-  warn "Antigravity не найден. Установи .deb/.rpm или распакуй tar.gz с https://antigravity.google/download и перезапусти скрипт."
+  warn "Antigravity не найден. Установи .deb/.rpm, распакуй tar.gz или поставь CLI (agy) с https://antigravity.google/download и перезапусти скрипт."
   warn "В AppImage-версии патч невозможен (файл временный) — используй .deb/.rpm/tar.gz."
 fi
 

@@ -106,7 +106,17 @@ find_apps() {
   if [ -n "$AG_APP" ] && [ -d "$AG_APP" ]; then
     APPS=("$AG_APP")
   fi
-  [ ${#APPS[@]} -gt 0 ]
+  [ ${#APPS[@]} -gt 0 ] || [ -n "$(find_agy)" ]
+}
+
+# Antigravity CLI (`agy`) — живёт отдельно от .app; патчится тем же байтовым патчем
+AGY_BIN=""
+find_agy() {
+  local a
+  for a in "$(command -v agy 2>/dev/null)" "${AGY_CANDIDATES[@]}"; do
+    [ -n "$a" ] && [ -f "$a" ] && { echo "$a"; return 0; }
+  done
+  return 1
 }
 
 # Патч-цели: Language Server внутри бандла (+ extensions-путь старых сборок) и agy CLI.
@@ -188,6 +198,30 @@ patch_binaries() {
   # seal бандла битый, если мы патчили сейчас ИЛИ он уже был пропатчен — только тогда переподписываем
   [ "$total" -gt 0 ] || [ "$already" -gt 0 ] && NEED_RESIGN=1
   return 0
+}
+
+# CLI: тот же ineligible->inexigible, через temp+rename (bpatch) + ad-hoc подпись
+patch_cli() {
+  AGY_BIN=$(find_agy) || return 1
+  ensure_helper
+  local n rc
+  n=$(perl "$HELPER" bpatch "$AGY_BIN" 2>/dev/null); rc=$?
+  case $rc in
+    0) codesign --force --sign - "$AGY_BIN" 2>/dev/null
+       ok "CLI: agy пропатчен ($n вхожд.): $AGY_BIN" ;;
+    2) ok "CLI: agy уже пропатчен: $AGY_BIN" ;;
+    4) warn "CLI: строка в agy не найдена — новая сборка? Не тронут." ;;
+    *) err "CLI: не удалось пропатчить $AGY_BIN" ;;
+  esac
+}
+
+revert_cli() {
+  AGY_BIN=$(find_agy) || return 0
+  local out_cnt
+  out_cnt=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$AGY_BIN" 2>/dev/null || echo 0)
+  [ "$out_cnt" -eq 0 ] && return 0
+  perl -0777 -pi -e 's/inexigible/ineligible/g' "$AGY_BIN" && codesign --force --sign - "$AGY_BIN" 2>/dev/null
+  ok "CLI: agy откачен ($out_cnt вхожд.): $AGY_BIN"
 }
 
 # патч (и откат) ломают seal бандла → GUI-запуск даёт «повреждено»;
@@ -720,6 +754,9 @@ watch_loop() {
       echo "$(date '+%F %T') decline-флаг — выход" >> "$WATCH_LOG"; exit 0
     fi
     local targets="" APP f
+    local agy; agy=$(find_agy)
+    [ -n "$agy" ] && targets="$agy
+"
     for APP in "${APPS[@]}"; do
       for f in "$APP"/Contents/Resources/bin/language_server* \
                "$APP"/Contents/Resources/app/extensions/antigravity/bin/language_server* \
@@ -859,6 +896,11 @@ show_status() {
       fi
     done
   done
+  local agy; agy=$(find_agy)
+  if [ -n "$agy" ]; then
+    local o; o=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$agy" 2>/dev/null || echo 0)
+    if [ "$o" -gt 0 ]; then ok "CLI: agy пропатчен ($o вхожд.): $agy"; else warn "CLI: agy НЕ пропатчен: $agy"; fi
+  fi
   if grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
     ok "hosts-блок:"
     sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | sed '1d;$d' | sed 's/^/    /'
@@ -873,11 +915,12 @@ show_status() {
 trap '[ -n "$HELPER" ] && rm -f "$HELPER" 2>/dev/null' EXIT
 
 find_apps || true
-if [ ${#APPS[@]} -gt 0 ]; then
-  say "Найдено бандлов: ${#APPS[@]}"
-  printf '  - %s\n' "${APPS[@]}"
+AGY_BIN=$(find_agy)
+if [ ${#APPS[@]} -gt 0 ] || [ -n "$AGY_BIN" ]; then
+  [ ${#APPS[@]} -gt 0 ] && { say "Найдено бандлов: ${#APPS[@]}"; printf '  - %s\n' "${APPS[@]}"; }
+  [ -n "$AGY_BIN" ] && say "  - CLI: $AGY_BIN"
 else
-  warn "Antigravity не найден. Установи Desktop или IDE с https://antigravity.google/download (macOS Apple Silicon/Intel) и перезапусти скрипт."
+  warn "Antigravity не найден. Установи Desktop, IDE или CLI с https://antigravity.google/download и перезапусти скрипт."
 fi
 
 while true; do
@@ -897,16 +940,19 @@ while true; do
   printf "Выбор: "
   read -r choice || { say ""; exit 0; }
   case "$choice" in
-    1) [ ${#APPS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
+    1) [ ${#APPS[@]} -eq 0 ] && [ -z "$(find_agy)" ] && { err "Antigravity не найден"; continue; }
        kill_processes
        for APP in "${APPS[@]}"; do patch_install "$APP"; done
+       patch_cli
        dns_pin ;;
-    2) [ ${#APPS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
+    2) [ ${#APPS[@]} -eq 0 ] && [ -z "$(find_agy)" ] && { err "Antigravity не найден"; continue; }
        kill_processes
-       for APP in "${APPS[@]}"; do patch_install "$APP"; done ;;
+       for APP in "${APPS[@]}"; do patch_install "$APP"; done
+       patch_cli ;;
     3) dns_pin ;;
     4) show_status ;;
     5) for APP in "${APPS[@]}"; do kill_processes; revert_install "$APP"; done
+       revert_cli
        remove_hosts_block
        uninstall_watchdog
        touch "$DECLINE_FLAG"

@@ -8,6 +8,8 @@
 | Linux x86_64 (.deb / .rpm / tar.gz) | [`linux/ag_unlocker_linux.sh`](linux/ag_unlocker_linux.sh) | ✅ Desktop 2.11.0 / 2.19.1, IDE 2.5.5 — патч+откат верифицированы |
 | macOS 12+ (Apple Silicon / Intel) | [`macos/ag_unlocker_mac.sh`](macos/ag_unlocker_mac.sh) | ✅ Desktop 2.10.0–2.19.1 (полная проверка), IDE 2.5.5 — патч+откат верифицированы |
 
+Antigravity CLI (`agy`) поддержан на обеих платформах: если Desktop/IDE не стоят, скрипт найдёт `agy` в PATH и пропатчит его отдельно.
+
 > Поддерживаются **оба продукта** со страницы [antigravity.google/download](https://antigravity.google/download): Antigravity (Desktop) и standalone Antigravity IDE. Если стоят оба — патчатся оба за один запуск.
 >
 > Скрипты написаны с нуля на чистом bash, повторяют проверенные методы оригинала.
@@ -182,7 +184,8 @@ IDE уже патчилась другой/старой версией анло�
 | «Fast route» через HTTPS_PROXY-релей | ❌ | Адреса прокси и relay-ключ автор вырезал из публичных исходников |
 | Локальный DNS-релей с watchdog | ⚙️ частично | Релей не нужен (хватает пина), watchdog с авто-репатчем перенесён — пункт 6 |
 | IPv6 prefixpolicy-хак | ❌ не нужен | На macOS hosts перекрывает DNS для обеих адресных семей |
-| Патчер Gemini CLI | ❌ | В оригинале помечен deprecated |
+| Патчер Antigravity CLI (`agy`) | ✅ перенесён | |
+| Патчер Gemini CLI | ❌ | В оригинале помечен deprecated; Google закрыл вход личных аккаунтов серверно |
 
 ---
 
