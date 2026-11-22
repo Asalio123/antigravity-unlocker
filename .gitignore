@@ -1,0 +1,6 @@
+# Compiled binaries & build artifacts
+/dist/
+/ag-unlocker
+/ag-unlocker-*
+*.exe
+.DS_Store
