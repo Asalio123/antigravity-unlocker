@@ -15,17 +15,18 @@
 #       (regex по минифицированному телу, порт patch_ide.rs оригинала 1-в-1)
 #       + fallback имени в extensions/antigravity/dist/extension.js.
 #       Перед первой правкой делается бэкап <файл>.ag_backup, откат = restore из него.
-#    2) DNS-пин: анблок-DNS (geohide.ru / comss.one / dns-ai.ru; UDP + DoH)
+#    2) DNS-пин: анблок-DNS (eu.geohide.ru / dns.geohide.ru / dns.dns-ai.ru; UDP + DoH)
 #       отдают российским клиентам IP своих SNI-прокси вместо Google; живые
 #       адреса пинуются в /etc/hosts (маркеры AG_UNLOCKER_HOSTS_*).
-#       Ответ провайдера считается подменой, если его /16-подсеть отличается
-#       от эталонной (8.8.8.8 / 1.1.1.1). DoH идёт мимо VPN-туннеля —
-#       выключать VPN не нужно. Watchdog (пункт 6) авторепатчит после обновлений.
+#       Ответ считается подменой, если он вне /16 эталона (8.8.8.8 / 1.1.1.1)
+#       и вне известных диапазонов Google. DoH идёт мимо VPN-туннеля (с fallback),
+#       а боевая проба проверяет оба пути — /32 маршруты ставятся точечно.
+#       Watchdog (пункт 6) авторепатчит после обновлений.
 #
-#  Зависимости: bash, perl, dig (dnsutils), curl, coreutils. На Linux подписи
-#  не проверяются — переподписка не нужна (в отличие от macOS-версии).
+#  Зависимости: bash, perl, curl, coreutils (+ dig из dnsutils/bind-utils для UDP).
+#  На Linux подписи не проверяются — переподписка не нужна (в отличие от macOS).
 #
-#  Запуск:  sudo bash ag_unlocker_linux.sh
+#  Запуск:  bash ag_unlocker_linux.sh  (sudo запросится только где нужны права)
 # ============================================================================
 
 MARKER_BEGIN="# AG_UNLOCKER_HOSTS_BEGIN"
@@ -34,21 +35,47 @@ MARKER_END="# AG_UNLOCKER_HOSTS_END"
 HOSTS="${AG_HOSTS:-/etc/hosts}"
 DOMAINS=(
   "daily-cloudcode-pa.googleapis.com"
-  "generativelanguage.googleapis.com"
-  # endpoint IDE (confeden 2.11+: оверрайд эндпоинта убран, подменяющий провайдер есть в пуле).
-  # Если подмены нет — домен просто не пинуется, остальные не страдают.
   "cloudcode-pa.googleapis.com"
+  "generativelanguage.googleapis.com"
+  "aicode.googleapis.com"
 )
-# xbox-dns.ru выкинут: с 07.10.2026 сервис мёртв (РКН добился блокировки у хостера).
-# Остались geohide/comss (UDP) + DoH-эндпоинты тех же сервисов и dns-ai.ru
-# (DoH-only, HTTP/2; IP захардкожены — сертификат по имени защищает при протухшем IP).
-PROVIDERS=(45.155.204.190 37.230.192.51 83.220.169.155 212.109.195.93 195.133.25.16)
+# DNS-пул (актуализировано 2026-11-22 живыми пробами):
+# - xbox-dns.ru мёртв с окт 2026;
+# - comss.one выкинут: отдаёт прямые IP Google (172.217 / 142.251), гейт не снимает;
+# - eu.geohide.ru (4 живых UDP-узла) + dns.geohide.ru (UDP + DoH) подменяют
+#   daily-cloudcode-pa, generativelanguage и aicode;
+# - dns.dns-ai.ru (DoH HTTP/2, обновлённые IP) дополнительно покрывает cloudcode-pa.
+# Дополнительно можно передать свой DNS: AG_CUSTOM_DNS="1.2.3.4" (или несколько через запятую).
+PROVIDERS=(31.25.239.132 143.20.64.192 5.175.161.3 37.221.93.141 37.230.192.51)
 DOH_PROVIDERS=(
+  "dns.dns-ai.ru|194.87.196.13,45.151.102.219,185.251.90.181|h2"
   "dns.geohide.ru|37.230.192.51,45.155.204.190|h1"
-  "dns.comss.one|83.220.169.155,212.109.195.93,195.133.25.16|h1"
-  "dns.dns-ai.ru|192.144.59.14,186.246.49.127,185.251.90.181|h2"
 )
 REFERENCE=(8.8.8.8 1.1.1.1)
+
+# Контекст реального пользователя сохраняем даже при запуске через sudo:
+# иначе HOME=/root и обрезанный PATH ломают поиск в ~/, ~/.gemini/bin и systemd --user.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF_SCRIPT="$SCRIPT_DIR/$(basename "$0")"
+CALLER_PWD="${AG_CALLER_PWD:-$(pwd)}"
+REAL_USER="${AG_REAL_USER:-${SUDO_USER:-$(id -un)}}"
+REAL_UID="${AG_REAL_UID:-${SUDO_UID:-$(id -u)}}"
+if [ -n "${AG_REAL_HOME:-}" ]; then
+  REAL_HOME="$AG_REAL_HOME"
+elif [ -n "${SUDO_USER:-}" ]; then
+  REAL_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+fi
+[ -z "$REAL_HOME" ] && REAL_HOME="$HOME"
+USER_PATH="${AG_USER_PATH:-$PATH}"
+
+# ~/.gemini/bin/agy — бэкенд Antigravity IDE 2.6.0+ и расширения VS Code / Cursor / Windsurf
+AGY_CANDIDATES=(
+  "$REAL_HOME/.gemini/bin/agy"
+  "/usr/local/bin/agy"
+  "/usr/bin/agy"
+  "$REAL_HOME/.local/bin/agy"
+  "$REAL_HOME/bin/agy"
+)
 
 C_OK='\033[32m'; C_WARN='\033[33m'; C_ERR='\033[31m'; C_INFO='\033[36m'; C_N='\033[0m'
 say()  { printf "%b\n" "$1"; }
@@ -57,37 +84,68 @@ warn() { say "${C_WARN}[!]${C_N} $1"; }
 err()  { say "${C_ERR}[X]${C_N} $1"; }
 info() { say "${C_INFO}[i]${C_N} $1"; }
 
-# ---------------------------------------------------------------- sudo gate
-# --watch: фоновый режим watchdog (из systemd --user) — без меню и без sudo
-if [ "$1" = "--watch" ]; then
-  AG_NO_ELEVATE=1
-fi
-# AG_NO_ELEVATE=1 — dev/CI-режим: не поднимать права
-if [ "$(id -u)" -ne 0 ] && [ -z "$AG_NO_ELEVATE" ]; then
-  info "Нужен root (патч бинарей + запись /etc/hosts). Перезапуск через sudo..."
-  exec sudo bash "$0" "$@"
-fi
-
-if ! command -v dig >/dev/null 2>&1; then
-  err "dig не найден (пакет dnsutils). Установи: sudo apt install -y dnsutils  (или bind-utils на rpm-системах)"
-  exit 1
-fi
+# Привилегированные операции (патч системных файлов, /etc/hosts, маршруты)
+# повышают права точечно; меню, статус и watchdog живут в пользовательской сессии.
+run_privileged() {
+  local action="$1"
+  if [ "$(id -u)" -eq 0 ] || [ -n "$AG_NO_ELEVATE" ]; then
+    dispatch_privileged "$action"
+    return $?
+  fi
+  info "Нужен root — запрашиваю sudo..."
+  sudo \
+    AG_REAL_USER="$REAL_USER" \
+    AG_REAL_UID="$REAL_UID" \
+    AG_REAL_HOME="$REAL_HOME" \
+    AG_USER_PATH="$USER_PATH" \
+    AG_CALLER_PWD="$CALLER_PWD" \
+    AG_HOSTS="$HOSTS" \
+    AG_ROOT="${AG_ROOT:-}" \
+    AG_CUSTOM_DNS="${AG_CUSTOM_DNS:-}" \
+    /bin/bash "$SELF_SCRIPT" --privileged "$action"
+}
 
 # ---------------------------------------------------------------- app discovery
+resolve_path() {
+  perl -MCwd=abs_path -e 'my $r = abs_path($ARGV[0]); print(defined $r ? $r : $ARGV[0])' "$1" 2>/dev/null || echo "$1"
+}
+
+is_elf_target() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  case "$f" in *.agtmp|*.ag_backup|*.log|*.txt) return 1 ;; esac
+  file "$f" 2>/dev/null | grep -q "ELF"
+}
+
+# Все уникальные бинари agy: CLI из PATH + ~/.gemini/bin/agy (IDE 2.6+ и VS Code).
+AGY_BINS=()
+collect_agy_bins() {
+  AGY_BINS=()
+  local raw=() a rp seen=""
+  local from_path
+  from_path=$(PATH="$USER_PATH" command -v agy 2>/dev/null)
+  [ -n "$from_path" ] && raw+=("$from_path")
+  for a in "${AGY_CANDIDATES[@]}"; do raw+=("$a"); done
+  for a in "${raw[@]}"; do
+    [ -n "$a" ] && [ -e "$a" ] || continue
+    rp=$(resolve_path "$a")
+    is_elf_target "$rp" || continue
+    case "$seen" in *"|$rp|"*) continue ;; esac
+    seen="$seen|$rp|"
+    AGY_BINS+=("$rp")
+  done
+}
+
 # INSTALLS — пути к resources-директориям (Desktop и IDE могут стоять одновременно).
-# Порядок: пакетный менеджер -> find по стандартным корням.
+# Порядок: AG_ROOT -> пакетный менеджер -> find по стандартным корням, CWD и папке скрипта.
 find_installs() {
   INSTALLS=()
-  local found="" p
-  # AG_ROOT=/path/to/Antigravity/resources — ручной путь для нестандартных установок
+  collect_agy_bins
   if [ -n "$AG_ROOT" ] && [ -d "$AG_ROOT" ]; then
     INSTALLS+=("$AG_ROOT")
     return 0
   fi
-  # Antigravity CLI (`agy`) без Desktop/IDE: каталог с agy — сам по себе install root
-  local agy_bin
-  agy_bin=$(command -v agy 2>/dev/null)
-  [ -n "$agy_bin" ] && INSTALLS+=("$(dirname "$agy_bin")")
+  local found="" p rp root seen=""
   if command -v dpkg >/dev/null 2>&1; then
     found=$(dpkg -L antigravity antigravity-ide 2>/dev/null | grep -E 'bin/language_server(_linux_x64)?$')
   fi
@@ -95,51 +153,70 @@ find_installs() {
     found="$found
 $(rpm -ql antigravity antigravity-ide 2>/dev/null | grep -E 'bin/language_server(_linux_x64)?$')"
   fi
-  # Desktop: resources/bin/language_server; tar.gz-установки живут где угодно
-  # (суффикс платформы в имени LS может дрейфовать — как и у оригинала, берём language_server*)
-  found="$found
-$(find /opt /usr/share /usr/lib /usr/local/share "$HOME/.antigravity" "$HOME/opt" "$HOME" \
-       -maxdepth 6 -type f -path "*ntigravity*" -name "language_server*" 2>/dev/null | grep -v AppImage)"
-  # IDE: language_server лежит глубже (resources/app/extensions/...), надёжнее искать
-  # по out/main.js — он есть только у IDE (у Desktop JS живёт в app.asar/dist)
-  found="$found
-$(find /opt /usr/share /usr/lib /usr/local/share "$HOME/.local/share" "$HOME" \
-       -maxdepth 6 -type f -path "*ntigravity*" -regex ".*/resources/app/out/main\.js" 2>/dev/null)"
-  for p in $found; do
-    local root
-    case "$p" in
-      */resources/app/out/main.js)                root=$(dirname "$(dirname "$(dirname "$p")")") ;;  # IDE по main.js
-      */resources/app/extensions/antigravity/bin/*)
-        root=$(dirname "$(dirname "$(dirname "$(dirname "$(dirname "$p")")")")") ;;                    # IDE по LS
-      *) root=$(dirname "$(dirname "$p")") ;;                                                          # Desktop LS
-    esac
-    [ -d "$root" ] && INSTALLS+=("$root")
+  local search_roots=(/opt /usr/share /usr/lib /usr/local/share "$REAL_HOME/.antigravity" "$REAL_HOME/opt" "$REAL_HOME/.local/share" "$REAL_HOME" "$CALLER_PWD" "$SCRIPT_DIR")
+  local existing_roots=() r rseen=""
+  for r in "${search_roots[@]}"; do
+    [ -d "$r" ] || continue
+    case "$rseen" in *"|$r|"*) continue ;; esac
+    rseen="$rseen|$r|"
+    existing_roots+=("$r")
   done
-  # дедуп (desktop может найтись и через пакетник, и через find)
-  if [ ${#INSTALLS[@]} -gt 1 ]; then
-    local u
-    u=$(printf '%s\n' "${INSTALLS[@]}" | sort -u)
-    INSTALLS=()
-    while IFS= read -r p; do [ -n "$p" ] && INSTALLS+=("$p"); done <<< "$u"
+  if [ ${#existing_roots[@]} -gt 0 ]; then
+    # Desktop/IDE: language_server* (отсеиваем логи, бэкапы, временники и AppImage)
+    found="$found
+$(find "${existing_roots[@]}" -maxdepth 6 -type f \
+       \( -iname "*antigravity*" -o -path "*/resources/bin/*" -o -path "*/extensions/antigravity/*" \) \
+       -name "language_server*" ! -name "*.log" ! -name "*.txt" ! -name "*.agtmp" ! -name "*.ag_backup" \
+       2>/dev/null | grep -v AppImage)"
+    # IDE: resources/app/out/main.js (у IDE 2.6+ language_server вынесен в ~/.gemini/bin/agy)
+    found="$found
+$(find "${existing_roots[@]}" -maxdepth 6 -type f \
+       -iname "*antigravity*" -regex ".*/resources/app/out/main\.js" 2>/dev/null)"
   fi
+  while IFS= read -r p; do
+    [ -n "$p" ] && [ -e "$p" ] || continue
+    case "$p" in
+      */resources/app/out/main.js)
+        root=$(dirname "$(dirname "$(dirname "$p")")")
+        ;;
+      */resources/app/extensions/antigravity/bin/*)
+        rp=$(resolve_path "$p")
+        is_elf_target "$rp" || continue
+        root=$(dirname "$(dirname "$(dirname "$(dirname "$(dirname "$p")")")")")
+        ;;
+      *)
+        rp=$(resolve_path "$p")
+        is_elf_target "$rp" || continue
+        root=$(dirname "$(dirname "$p")")
+        ;;
+    esac
+    [ -d "$root" ] || continue
+    root=$(resolve_path "$root")
+    case "$seen" in *"|$root|"*) continue ;; esac
+    seen="$seen|$root|"
+    INSTALLS+=("$root")
+  done <<< "$found"
+  [ ${#INSTALLS[@]} -gt 0 ] || [ ${#AGY_BINS[@]} -gt 0 ]
 }
 
-# Патч-цели установки: language_server (+ agy из PATH, если вдруг есть).
+# Патч-цели внутри одной установки: только ELF language_server* с целевой строкой.
 collect_targets() {
   RES="$1"   # путь к resources
   TARGETS=()
   local candidates=(
-    "$RES/bin/language_server"
-    "$RES/app/extensions/antigravity/bin/language_server"*
-    "$RES/agy"
+    "$RES"/bin/language_server*
+    "$RES"/app/extensions/antigravity/bin/language_server*
   )
-  local agy
-  agy=$(command -v agy 2>/dev/null) && [ -n "$agy" ] && candidates+=("$agy")
-  local f
+  local f rp seen=""
   for f in "${candidates[@]}"; do
-    [ -f "$f" ] || continue
-    file "$f" | grep -q "ELF" || continue
-    grep -q "ineligible\|inexigible" "$f" && TARGETS+=("$f")
+    [ -e "$f" ] || continue
+    rp=$(resolve_path "$f")
+    is_elf_target "$rp" || continue
+    case "$seen" in *"|$rp|"*) continue ;; esac
+    if grep -q "ineligible\|inexigible" "$rp" 2>/dev/null; then
+      seen="$seen|$rp|"
+      TARGETS+=("$rp")
+    fi
   done
 }
 
@@ -158,9 +235,16 @@ check_arch() {
 
 kill_processes() {
   [ -n "$AG_NO_ELEVATE" ] && return 0   # dev/CI-режим: чужие процессы не трогаем
-  pkill -if "antigravity" 2>/dev/null
-  pkill -if "language_server" 2>/dev/null
-  pkill -if "agy" 2>/dev/null
+  # Точечный kill: не убиваем сам скрипт, даже если он запущен из папки antigravity-unlocker.
+  local pid cmd
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$$" ] || [ "$pid" = "$PPID" ] && continue
+    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmd" in *ag_unlocker*) continue ;; esac
+    kill "$pid" 2>/dev/null || true
+  done <<< "$(pgrep -if 'antigravity|language_server' 2>/dev/null || true)"
+  pkill -x "agy" 2>/dev/null || true
   sleep 1
 }
 
@@ -168,27 +252,24 @@ kill_processes() {
 patch_binaries() {
   local RES="$1"; local total=0
   collect_targets "$RES"
-  [ ${#TARGETS[@]} -eq 0 ] && { err "Патч-цели не найдены"; return 1; }
-  local f in_cnt out_cnt
+  if [ ${#TARGETS[@]} -eq 0 ]; then
+    if [ -d "$RES/app/extensions/agy" ]; then
+      info "IDE 2.6+: встроенного language_server нет, бэкенд патчится в ~/.gemini/bin/agy"
+      return 0
+    fi
+    err "Патч-цели не найдены"
+    return 1
+  fi
+  ensure_helper
+  local f n rc
   for f in "${TARGETS[@]}"; do
-    in_cnt=$(perl -0777 -ne 'my $c=()=/ineligible/g; print $c' "$f")
-    out_cnt=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$f")
-    if [ "$in_cnt" -eq 0 ] && [ "$out_cnt" -gt 0 ]; then
-      ok "уже пропатчен: $f ($out_cnt вхожд.)"
-      continue
-    fi
-    if [ "$in_cnt" -eq 0 ]; then
-      warn "строка не найдена — новая сборка? Пропускаю: $f"
-      continue
-    fi
-    perl -0777 -pi -e 's/ineligible/inexigible/g' "$f" || { err "не удалось записать: $f"; continue; }
-    out_cnt=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$f")
-    if [ "$out_cnt" -eq "$in_cnt" ]; then
-      ok "пропатчен ($out_cnt вхожд.): $f"
-      total=$((total+1))
-    else
-      err "проверка после патча не сошлась: $f"
-    fi
+    n=$(perl "$HELPER" bpatch "$f" 2>/dev/null); rc=$?
+    case $rc in
+      0) ok "пропатчен ($n вхожд.): $f"; total=$((total+1)) ;;
+      2) ok "уже пропатчен: $f" ;;
+      4) warn "строка не найдена — новая сборка? Пропускаю: $f" ;;
+      *) err "не удалось записать: $f" ;;
+    esac
   done
   [ "$total" -gt 0 ] && info "Патч применён к $total файл(ам). Запусти Antigravity и войди в Google-аккаунт."
   return 0
@@ -197,15 +278,48 @@ patch_binaries() {
 unpatch_binaries() {
   local RES="$1"; local total=0
   collect_targets "$RES"
-  local f out_cnt
+  ensure_helper
+  local f n rc
   for f in "${TARGETS[@]}"; do
-    out_cnt=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$f" 2>/dev/null || echo 0)
-    [ "$out_cnt" -eq 0 ] && continue
-    perl -0777 -pi -e 's/inexigible/ineligible/g' "$f" || { err "не удалось откатить: $f"; continue; }
-    ok "откачен ($out_cnt вхожд.): $f"
-    total=$((total+1))
+    n=$(perl "$HELPER" bunpatch "$f" 2>/dev/null); rc=$?
+    case $rc in
+      0) ok "откачен ($n вхожд.): $f"; total=$((total+1)) ;;
+      2) : ;;
+      *) err "не удалось откатить: $f" ;;
+    esac
   done
   [ "$total" -eq 0 ] && info "Пропатченных бинарей не найдено."
+}
+
+patch_cli() {
+  collect_agy_bins
+  [ ${#AGY_BINS[@]} -eq 0 ] && return 0
+  ensure_helper
+  local f n rc
+  for f in "${AGY_BINS[@]}"; do
+    n=$(perl "$HELPER" bpatch "$f" 2>/dev/null); rc=$?
+    case $rc in
+      0) ok "agy пропатчен ($n вхожд.): $f" ;;
+      2) ok "agy уже пропатчен: $f" ;;
+      4) warn "строка в agy не найдена — новая сборка? Не тронут: $f" ;;
+      *) err "не удалось пропатчить $f" ;;
+    esac
+  done
+}
+
+revert_cli() {
+  collect_agy_bins
+  [ ${#AGY_BINS[@]} -eq 0 ] && return 0
+  ensure_helper
+  local f n rc
+  for f in "${AGY_BINS[@]}"; do
+    n=$(perl "$HELPER" bunpatch "$f" 2>/dev/null); rc=$?
+    case $rc in
+      0) ok "agy откачен ($n вхожд.): $f" ;;
+      2) : ;;
+      *) err "не удалось откатить $f" ;;
+    esac
+  done
 }
 
 # ---------------------------------------------------------------- IDE JS patch
@@ -243,17 +357,21 @@ if ($mode eq 'parse') {
     # A-записи из DNS wire ответа, по одной на строку
     open my $fh, '<:raw', $file or exit 1;
     local $/; my $d = <$fh>; close $fh;
+    exit 0 if !defined($d) || length($d) < 12;
     my (undef, undef, $qd, $an) = unpack("n4", $d);
-    my $off = 12;
+    my ($off, $len) = (12, length($d));
     for (1..$qd) {
-        while (1) { my $l = unpack("C", substr($d,$off,1)); $off++;
+        while ($off < $len) { my $l = unpack("C", substr($d,$off,1)); $off++;
             last if $l == 0; if ($l >= 192) { $off++; last; } $off += $l; }
         $off += 4;
+        exit 0 if $off > $len;
     }
     for (1..$an) {
-        while (1) { my $l = unpack("C", substr($d,$off,1)); $off++;
+        while ($off < $len) { my $l = unpack("C", substr($d,$off,1)); $off++;
             last if $l == 0; if ($l >= 192) { $off++; last; } $off += $l; }
+        last if $off + 10 > $len;
         my ($type, undef, undef, $rdlen) = unpack("nnNn", substr($d,$off,10)); $off += 10;
+        last if $off + $rdlen > $len;
         print join(".", unpack("C4", substr($d,$off,4))), "\n" if $type == 1 && $rdlen == 4;
         $off += $rdlen;
     }
@@ -285,9 +403,14 @@ sub backup_once {
 sub write_atomic {
     my ($f, $content) = @_;
     my $tmp = "$f.$$.agtmp";
+    my (undef, undef, $modebits, undef, $uid, $gid) = stat($f);
     open my $out, '>', $tmp or die "не записать $tmp: $!";
     print $out $content;
     close $out;
+    if (defined $modebits) {
+        chmod($modebits & 07777, $tmp);
+        chown($uid, $gid, $tmp);
+    }
     rename($tmp, $f) or do { unlink $tmp; die "rename $tmp -> $f: $!"; };
 }
 sub has_marker {
@@ -318,22 +441,30 @@ if ($mode eq 'revert') {
     }
     exit 2;
 }
-if ($mode eq 'bpatch') {
-    # байтовый патч бинаря через temp+rename: работает по живому процессу (ETXTBSY-safe)
+if ($mode eq 'bpatch' || $mode eq 'bunpatch') {
+    # атомарный байтовый патч/откат через temp+rename (ETXTBSY-safe, сохраняет права и владельца)
     my $data = slurp_bin($file);
     my $in = () = $data =~ /ineligible/g;
     my $outc = () = $data =~ /inexigible/g;
-    exit 2 if $in == 0 && $outc > 0;   # уже пропатчен
-    exit 4 if $in == 0;                # сигнатуры нет — новая сборка
-    $data =~ s/ineligible/inexigible/g;
+    if ($mode eq 'bpatch') {
+        exit 2 if $in == 0 && $outc > 0;   # уже пропатчен
+        exit 4 if $in == 0;                # сигнатуры нет — новая сборка
+        $data =~ s/ineligible/inexigible/g;
+    } else {
+        exit 2 if $outc == 0;              # не пропатчен
+        $data =~ s/inexigible/ineligible/g;
+    }
     my $tmp = "$file.$$.agtmp";
+    my (undef, undef, $modebits, undef, $uid, $gid) = stat($file);
     open my $out, '>:raw', $tmp or exit 1;
     print $out $data;
     close $out;
-    my (undef, undef, $modebits) = stat($file);
-    chmod($modebits & 07777, $tmp);
+    if (defined $modebits) {
+        chmod($modebits & 07777, $tmp);
+        chown($uid, $gid, $tmp);
+    }
     rename($tmp, $file) or do { unlink $tmp; exit 1; };
-    print "$in\n";
+    print(($mode eq 'bpatch' ? $in : $outc), "\n");
     exit 0;
 }
 my $content = slurp($file);
@@ -461,48 +592,125 @@ patch_install() {
 
 # ---------------------------------------------------------------- DNS pin
 DIG_OPT=""
+HAS_DIG=0
+DEAD_RESOLVERS=""
+LIVE_RESOLVERS=""
+RESOLVE_OUT=""
+
+is_dead_resolver() {
+  case "$DEAD_RESOLVERS" in *"|$1|"*) return 0 ;; esac
+  return 1
+}
+mark_live_resolver() {
+  case "$LIVE_RESOLVERS" in *"|$1|"*) return 0 ;; esac
+  LIVE_RESOLVERS="$LIVE_RESOLVERS|$1|"
+}
+mark_dead_resolver() {
+  # Баним до конца прогона только тех, кто не ответил ни разу (мертвые ноды)
+  case "$LIVE_RESOLVERS" in *"|$1|"*) return 0 ;; esac
+  is_dead_resolver "$1" || DEAD_RESOLVERS="$DEAD_RESOLVERS|$1|"
+}
+
 # если UDP/53 наружу закрыт (VM/корпоративные сети), но TCP работает — переключаемся на DNS over TCP
 detect_dns_transport() {
-  if [ -z "$(dig +short +time=3 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
-    if [ -n "$(dig +short +tcp +time=3 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
+  HAS_DIG=0
+  if ! command -v dig >/dev/null 2>&1; then
+    warn "dig не найден (пакет dnsutils / bind-utils) — UDP-провайдеры пропущены, работаю через DoH"
+    return 0
+  fi
+  HAS_DIG=1
+  if [ -z "$(dig +short +time=2 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
+    if [ -n "$(dig +short +tcp +time=2 +tries=1 A google.com @8.8.8.8 2>/dev/null)" ]; then
       DIG_OPT="+tcp"
       info "UDP/53 недоступен — использую DNS over TCP"
     fi
   fi
 }
 
-dig_a() {
+dig_a() { # $1 = domain, $2 = server -> RESOLVE_OUT
+  RESOLVE_OUT=""
+  [ "$HAS_DIG" -eq 1 ] || return 1
+  is_dead_resolver "udp:$2" && return 1
   local out
-  out=$(dig $DIG_OPT +short +time=4 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
-  if [ -z "$out" ]; then
-    out=$(dig +tcp +short +time=4 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
+  out=$(dig $DIG_OPT +short +time=2 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
+  if [ -z "$out" ] && [ -z "$DIG_OPT" ]; then
+    out=$(dig +tcp +short +time=2 +tries=1 A "$1" @"$2" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u)
   fi
-  echo "$out"
+  if [ -z "$out" ]; then
+    mark_dead_resolver "udp:$2"
+    return 1
+  fi
+  mark_live_resolver "udp:$2"
+  RESOLVE_OUT="$out"
+  return 0
 }
 
 ref_net16() {
-  local r
-  for r in "${REFERENCE[@]}"; do dig_a "$1" "$r"; done | cut -d. -f1,2 | sort -u
+  local r out=""
+  if [ "$HAS_DIG" -eq 1 ]; then
+    for r in "${REFERENCE[@]}"; do
+      out="$out
+$(dig $DIG_OPT +short +time=3 +tries=1 A "$1" @"$r" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$')"
+    done
+  else
+    ensure_helper
+    local b64 tmp="${TMPDIR:-/tmp}/.ag_ref.$$"
+    b64=$(perl "$HELPER" query "$1") || true
+    for r in "https://1.1.1.1/dns-query" "https://8.8.8.8/dns-query"; do
+      if curl -s --connect-timeout 3 --max-time 4 "${r}?dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+        out="$out
+$(perl "$HELPER" parse "$tmp" 2>/dev/null)"
+      fi
+    done
+    rm -f "$tmp"
+  fi
+  printf '%s\n' "$out" | sed '/^$/d' | cut -d. -f1,2 | sort -u
+}
+
+# Отсекаем локальные/служебные адреса (вкл. VPN FakeIP 198.18/15) и известные
+# клиентские диапазоны Google (AS15169): иначе честный Google IP из соседней /16
+# (например 142.251.* при эталоне 172.217.*) ошибочно примется за прокси.
+is_non_proxy_ip() {
+  local ip="$1" ref_blocks="$2"
+  local o1 o2 net16
+  IFS='.' read -r o1 o2 _ _ <<< "$ip"
+  net16="$o1.$o2"
+  echo "$ref_blocks" | grep -qx "$net16" && return 0
+  case "$o1" in
+    0|10|127) return 0 ;;
+  esac
+  [ "$o1" -ge 224 ] 2>/dev/null && return 0
+  case "$net16" in
+    169.254|192.168|198.18|198.19) return 0 ;;
+    142.250|142.251|172.217|172.253|74.125|64.233|108.177|209.85|216.58|216.239) return 0 ;;
+  esac
+  [ "$o1" -eq 172 ] && [ "$o2" -ge 16 ] && [ "$o2" -le 31 ] && return 0
+  [ "$o1" -eq 100 ] && [ "$o2" -ge 64 ] && [ "$o2" -le 127 ] && return 0
+  return 1
 }
 
 # --- обход VPN для DoH-запросов: бинд на физический интерфейс (root есть)
 VPN_ON=0; CURL_IF=""
+vpn_active() {
+  ip -4 route show default 2>/dev/null | grep -qE 'dev (tun|wg|tap|utun|ppp|nordlynx|tailscale)'
+}
 phys_iface() {
-  ip route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap|utun)' | head -1 \
+  ip -4 route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap|utun|ppp|nordlynx|tailscale)' | head -1 \
     | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 setup_curl_bypass() {
   VPN_ON=0; CURL_IF=""
-  ip route show default 2>/dev/null | grep -qE 'dev (tun|wg|tap)' || return 0
+  vpn_active || return 0
   VPN_ON=1
   local dev; dev=$(phys_iface)
   [ -n "$dev" ] && CURL_IF="--interface $dev"
-  info "VPN активен — DoH-запросы пойдут мимо туннеля${dev:+ через $dev} (подмену отдают только RU-клиентам)"
+  info "VPN активен — DoH-запросы пойдут мимо туннеля${dev:+ через $dev} (с авто-fallback, если физический интерфейс заблокирован)"
 }
 
-# DoH A-запрос к одному провайдеру ("host|ip1,ip2|h1|h2") -> IPv4 построчно
+# DoH A-запрос к одному провайдеру ("host|ip1,ip2|h1|h2") -> RESOLVE_OUT: IPv4 построчно
 doh_a_one() {
   ensure_helper
+  RESOLVE_OUT=""
   local dom="$1" spec="$2"
   local host="${spec%%|*}" rest="${spec#*|}"
   local ips="${rest%%|*}" proto="${rest##*|}"
@@ -510,20 +718,65 @@ doh_a_one() {
   local b64 ip out tmp="${TMPDIR:-/tmp}/.ag_doh.$$"
   b64=$(perl "$HELPER" query "$dom") || return 1
   for ip in ${ips//,/ }; do
-    if curl -s $CURL_IF $h2 --max-time 6 --resolve "$host:443:$ip" \
-         "https://$host/dns-query?dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
-      out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
-      if [ -n "$out" ]; then rm -f "$tmp"; echo "$out"; return 0; fi
+    is_dead_resolver "doh:$host:$ip" && continue
+    local got=0
+    if [ -n "$CURL_IF" ]; then
+      if curl -s $CURL_IF $h2 --connect-timeout 2 --max-time 3 --resolve "$host:443:$ip" \
+           "https://$host/dns-query?dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+        out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
+        [ -n "$out" ] && got=1
+      fi
     fi
+    if [ "$got" -eq 0 ]; then
+      if curl -s $h2 --connect-timeout 2 --max-time 3 --resolve "$host:443:$ip" \
+           "https://$host/dns-query?dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+        out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
+        [ -n "$out" ] && got=1
+      fi
+    fi
+    if [ "$got" -eq 1 ]; then
+      rm -f "$tmp"
+      mark_live_resolver "doh:$host:$ip"
+      RESOLVE_OUT="$out"
+      return 0
+    fi
+    mark_dead_resolver "doh:$host:$ip"
   done
   rm -f "$tmp"
   return 1
 }
 
-# боевая проба: живой Google-ответ через кандидата (а не просто открытый порт)
-probe_ip() { # $1=domain $2=ip -> stdout: latency; exit 0 если жив
+doh_custom_url() {
+  ensure_helper
+  RESOLVE_OUT=""
+  local dom="$1" url="$2"
+  is_dead_resolver "cdoh:$url" && return 1
+  local b64 out tmp="${TMPDIR:-/tmp}/.ag_doh.$$" sep="?"
+  case "$url" in *\?*) sep="&" ;; esac
+  b64=$(perl "$HELPER" query "$dom") || return 1
+  if curl -s $CURL_IF --connect-timeout 3 --max-time 4 \
+       "${url}${sep}dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+    out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
+    if [ -n "$out" ]; then rm -f "$tmp"; RESOLVE_OUT="$out"; return 0; fi
+  fi
+  if [ -n "$CURL_IF" ] && curl -s --connect-timeout 3 --max-time 4 \
+       "${url}${sep}dns=$b64" -H "accept: application/dns-message" -o "$tmp" 2>/dev/null; then
+    out=$(perl "$HELPER" parse "$tmp" 2>/dev/null)
+    if [ -n "$out" ]; then rm -f "$tmp"; RESOLVE_OUT="$out"; return 0; fi
+  fi
+  rm -f "$tmp"
+  mark_dead_resolver "cdoh:$url"
+  return 1
+}
+
+# Боевая проба: живой Google-ответ с валидным TLS-сертификатом через кандидата.
+# $3 = "bypass" -> проба мимо VPN-туннеля ($CURL_IF).
+probe_ip() { # $1=domain $2=ip [$3=bypass] -> stdout: latency; exit 0 если жив
+  local iface_opt=""
+  [ "$3" = "bypass" ] && iface_opt="$CURL_IF"
   local out code
-  out=$(curl -s --max-time 6 --resolve "$1:443:$2" "https://$1/" -o /dev/null -w '%{http_code} %{time_total}' 2>/dev/null) || return 1
+  out=$(curl -s $iface_opt --connect-timeout 3 --max-time 5 --resolve "$1:443:$2" \
+    "https://$1/" -o /dev/null -w '%{http_code} %{time_total}' 2>/dev/null) || return 1
   code="${out%% *}"
   case "$code" in
     2*|3*|4*) echo "${out##* }"; return 0 ;;
@@ -532,26 +785,39 @@ probe_ip() { # $1=domain $2=ip -> stdout: latency; exit 0 если жив
 }
 
 dns_pin() {
-  # PIN_MAP — "domain:ip1,ip2|..." — IP пинуются строго per-domain.
-  # Кандидаты: UDP + DoH (с обходом туннеля при активном VPN). Перед пином —
-  # боевая HTTPS-проба каждого; пинуются до 2 быстрейших.
+  # PIN_LINES — строки для блока /etc/hosts ("<ip> <domain>" или "<ip> <domain> # ag-bypass").
+  # Проба проверяет сначала дефолтный маршрут; если под VPN дефолт не достучался,
+  # пробуем мимо туннеля ($CURL_IF) и ставим /32 маршрут только для таких IP.
   local domain ip prov spec
+  DEAD_RESOLVERS=""; LIVE_RESOLVERS=""
   detect_dns_transport
   setup_curl_bypass
-  PIN_MAP=""
-  local any_substituted=0
+  PIN_LINES=""
+  local any_substituted=0 daily_pinned=0
+  local all_udp=("${PROVIDERS[@]}")
+  local custom_doh=()
+  if [ -n "${AG_CUSTOM_DNS:-}" ]; then
+    local citem
+    for citem in ${AG_CUSTOM_DNS//,/ }; do
+      case "$citem" in
+        https://*) custom_doh+=("$citem") ;;
+        *) echo "$citem" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' && all_udp+=("$citem") ;;
+      esac
+    done
+  fi
+
   for domain in "${DOMAINS[@]}"; do
     local ref_blocks
     ref_blocks=$(ref_net16 "$domain")
     [ -z "$ref_blocks" ] && { warn "эталон не ответил для $domain — пропуск"; continue; }
     local cand=""
-    for prov in "${PROVIDERS[@]}"; do
-      local ans; ans=$(dig_a "$domain" "$prov"); [ -z "$ans" ] && continue
+    for prov in "${all_udp[@]}"; do
+      dig_a "$domain" "$prov" || continue
       local sub=""
       while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        echo "$ref_blocks" | grep -qx "${ip%.*.*}" || sub="$sub $ip"
-      done <<< "$ans"
+        is_non_proxy_ip "$ip" "$ref_blocks" || sub="$sub $ip"
+      done <<< "$RESOLVE_OUT"
       if [ -n "$sub" ]; then
         any_substituted=1
         info "$domain @ $prov -> подмена:$(echo $sub | tr ' ' ',')"
@@ -559,15 +825,28 @@ dns_pin() {
       fi
     done
     for spec in "${DOH_PROVIDERS[@]}"; do
-      local ans; ans=$(doh_a_one "$domain" "$spec"); [ -z "$ans" ] && continue
+      doh_a_one "$domain" "$spec" || continue
       local sub=""
       while IFS= read -r ip; do
         [ -z "$ip" ] && continue
-        echo "$ref_blocks" | grep -qx "${ip%.*.*}" || sub="$sub $ip"
-      done <<< "$ans"
+        is_non_proxy_ip "$ip" "$ref_blocks" || sub="$sub $ip"
+      done <<< "$RESOLVE_OUT"
       if [ -n "$sub" ]; then
         any_substituted=1
         info "$domain @ ${spec%%|*} (DoH) -> подмена:$(echo $sub | tr ' ' ',')"
+        cand="$cand $sub"
+      fi
+    done
+    for spec in "${custom_doh[@]}"; do
+      doh_custom_url "$domain" "$spec" || continue
+      local sub=""
+      while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        is_non_proxy_ip "$ip" "$ref_blocks" || sub="$sub $ip"
+      done <<< "$RESOLVE_OUT"
+      if [ -n "$sub" ]; then
+        any_substituted=1
+        info "$domain @ custom DoH -> подмена:$(echo $sub | tr ' ' ',')"
         cand="$cand $sub"
       fi
     done
@@ -576,45 +855,65 @@ dns_pin() {
       warn "$domain: подмены нет ни у одного провайдера — домен не пиную"
       continue
     fi
-    local scored=""
+    # Параллельные боевые пробы всех кандидатов домена (быстрее в 5-10x)
+    local ptmp="${TMPDIR:-/tmp}/.ag_probe.$$"
+    : > "$ptmp"
     while IFS= read -r ip; do
       [ -z "$ip" ] && continue
-      local t
-      if t=$(probe_ip "$domain" "$ip"); then
-        scored="$scored$t $ip\n"
-      else
-        warn "$ip: боевая проба не прошла — не пиную"
-      fi
+      (
+        local t
+        if t=$(probe_ip "$domain" "$ip"); then
+          printf '%s %s default\n' "$t" "$ip" >> "$ptmp"
+        elif [ "$VPN_ON" -eq 1 ] && [ -n "$CURL_IF" ] && t=$(probe_ip "$domain" "$ip" bypass); then
+          printf '%s %s bypass\n' "$t" "$ip" >> "$ptmp"
+        else
+          warn "$ip: боевая проба не прошла — не пиную"
+        fi
+      ) &
     done <<< "$cand"
-    local top
-    top=$(printf '%b' "$scored" | sort -n | head -2 | awk '{print $2}')
-    [ -n "$top" ] && PIN_MAP="$PIN_MAP$domain:$(echo $top | tr ' ' ',')|"
+    wait
+    local scored
+    scored=$(sort -n "$ptmp" 2>/dev/null | head -2)
+    rm -f "$ptmp"
+    local line
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      local sip mode
+      sip=$(echo "$line" | awk '{print $2}')
+      mode=$(echo "$line" | awk '{print $3}')
+      if [ "$mode" = "bypass" ]; then
+        PIN_LINES="${PIN_LINES}${sip} ${domain} # ag-bypass
+"
+      else
+        PIN_LINES="${PIN_LINES}${sip} ${domain}
+"
+      fi
+      [ "$domain" = "daily-cloudcode-pa.googleapis.com" ] && daily_pinned=1
+    done <<< "$scored"
   done
 
-  if [ "$any_substituted" -eq 0 ] || [ -z "$(echo "$PIN_MAP" | tr -d ':|')" ]; then
-    err "Ни один провайдер не отдал подменённые адреса (UDP и DoH)."
-    warn "Варианты: ты не в регионе, для которого сервисы делают подмену, или все их узлы сейчас недоступны."
-    warn "Режим с VPN (пункт 2) от этого не зависит — там достаточно любого VPN с не-RU выходом."
+  if [ "$any_substituted" -eq 0 ] || [ -z "$(printf '%s' "$PIN_LINES" | tr -d ' \n')" ]; then
+    err "Ни один провайдер не отдал рабочих прокси-адресов (UDP и DoH)."
+    warn "Варианты: ты не в регионе подмены, провайдер режет прокси или узлы сейчас недоступны."
+    warn "Режим с VPN (пункт 2) от этого не зависит — достаточно VPN с не-датацентровым выходом."
     return 1
   fi
 
   write_hosts_block
+  if [ "$daily_pinned" -eq 0 ]; then
+    warn "Внимание: для основного домена daily-cloudcode-pa.googleapis.com рабочих прокси не нашлось — Desktop/CLI могут получать HTTP 400."
+  fi
 }
 
 write_hosts_block() {
-  local tmp="$HOSTS.ag_tmp" entry domain ips
+  drop_pin_routes
+  local tmp="$HOSTS.ag_tmp"
   if grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
     sed "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/d" "$HOSTS" > "$tmp" && mv "$tmp" "$HOSTS"
   fi
   {
     echo "$MARKER_BEGIN"
-    IFS='|' read -r -a ENTRIES <<< "${PIN_MAP%|}"
-    for entry in "${ENTRIES[@]}"; do
-      domain="${entry%%:*}"; ips="${entry#*:}"
-      for ip in $(echo "$ips" | tr ',' ' '); do
-        [ -n "$ip" ] && echo "$ip $domain"
-      done
-    done
+    printf '%s' "$PIN_LINES" | sed '/^$/d'
     echo "$MARKER_END"
   } >> "$HOSTS"
   # сброс кеша: systemd-resolved и/или nscd — если есть
@@ -625,20 +924,21 @@ write_hosts_block() {
   ensure_pin_routes
 }
 
-# --- host-routes мимо VPN-туннеля (см. mac-версию; серверная 400 по egress VPN)
+# --- host-routes мимо VPN-туннеля: ставятся ТОЛЬКО для прокси с пометкой # ag-bypass
 phys_gw() {
-  ip route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap)' | head -1 | awk '{print $3}'
+  ip -4 route show default 2>/dev/null | grep -vE 'dev (tun|wg|tap|utun|ppp|nordlynx|tailscale)' | head -1 \
+    | awk '{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}'
 }
 
 ensure_pin_routes() {
   [ "$(id -u)" -eq 0 ] || return 0
-  if ! ip route show default 2>/dev/null | grep -qE 'dev (tun|wg|tap)'; then
+  if ! vpn_active; then
     drop_pin_routes   # VPN выключен — /32 не нужны, а протухшие могут чёрнодырить
     return 0
   fi
   local gw dev; gw=$(phys_gw); dev=$(phys_iface); [ -z "$gw" ] || [ -z "$dev" ] && return 0
   local ip n=0
-  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" 2>/dev/null | awk '/# ag-bypass/ {print $1}' | sort -u); do
     ip route replace "$ip/32" via "$gw" dev "$dev" 2>/dev/null && n=$((n+1))
   done
   [ "$n" -gt 0 ] && info "VPN активен: $n маршрут(ов) на прокси-IP прописаны мимо туннеля (via $gw)"
@@ -647,7 +947,7 @@ ensure_pin_routes() {
 drop_pin_routes() {
   [ "$(id -u)" -eq 0 ] || return 0
   local ip
-  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk 'NF==2 {print $1}'); do
+  for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" 2>/dev/null | awk 'NF>=2 && $1 !~ /^#/ {print $1}' | sort -u); do
     ip route del "$ip/32" 2>/dev/null
   done
 }
@@ -669,30 +969,37 @@ remove_hosts_block() {
 # (size:mtime стабильны два тика), сигнатуры нет -> не трогаем до смены файла,
 # полный откат (пункт 5) выключает watchdog флагом-отказом.
 WATCH_LABEL="ag-unlocker-watch"
-WATCH_UNIT="$HOME/.config/systemd/user/$WATCH_LABEL.service"
-DECLINE_FLAG="$HOME/.ag_unlocker_no_watch"
-WATCH_STATE="${TMPDIR:-/tmp}/.ag_watch_state.$UID"
-WATCH_LOG="/tmp/ag_unlocker_watch.log"
+WATCH_UNIT="$REAL_HOME/.config/systemd/user/$WATCH_LABEL.service"
+DECLINE_FLAG="$REAL_HOME/.ag_unlocker_no_watch"
+WATCH_STATE="${TMPDIR:-/tmp}/.ag_watch_state.$REAL_UID"
+WATCH_LOG="/tmp/ag_unlocker_watch.$REAL_UID.log"
 
 f_sig() { stat -c '%s:%Y' "$1" 2>/dev/null || echo absent; }
-state_name() { echo "$1" | md5sum | cut -d' ' -f1; }
+state_name() { printf '%s' "$1" | md5sum | cut -d' ' -f1; }
 
 watch_loop() {
   mkdir -p "$WATCH_STATE"
-  echo "$(date '+%F %T') watchdog стартанул (pid $$)" >> "$WATCH_LOG"
+  echo "$(date '+%F %T') watchdog стартанул (pid $$, uid $(id -u))" >> "$WATCH_LOG"
   local tick=0
   while true; do
     if [ -f "$DECLINE_FLAG" ]; then
       echo "$(date '+%F %T') decline-флаг — выход" >> "$WATCH_LOG"; exit 0
     fi
-    find_installs
-    local targets="" RES f
+    find_installs 2>/dev/null || true
+    local targets="" RES f rp
+    for f in "${AGY_BINS[@]}"; do
+      [ -f "$f" ] && targets="$targets$f
+"
+    done
     for RES in "${INSTALLS[@]}"; do
       for f in "$RES"/bin/language_server* \
                "$RES"/app/extensions/antigravity/bin/language_server* \
                "$RES/app/out/main.js" \
                "$RES/app/extensions/antigravity/dist/extension.js"; do
-        [ -f "$f" ] && targets="$targets$f
+        [ -e "$f" ] || continue
+        case "$f" in *.agtmp|*.ag_backup|*.log|*.txt) continue ;; esac
+        rp=$(resolve_path "$f")
+        [ -f "$rp" ] && targets="$targets$rp
 "
       done
     done
@@ -722,6 +1029,7 @@ watch_loop() {
           esac
           ;;
         *)
+          is_elf_target "$f" || { printf '%s\n0\n' "$cur" > "$st"; continue; }
           local n rc
           n=$(perl "$HELPER" bpatch "$f" 2>/dev/null); rc=$?
           case $rc in
@@ -733,17 +1041,23 @@ watch_loop() {
       esac
       printf '%s\n0\n' "$cur" > "$st"
     done <<< "$targets"
-    # рефреш hosts-пина раз в ~10 мин: пин есть, но все IP домена мертвы -> рефреш
+    # рефреш hosts-пина раз в ~10 мин: проверяем только реально запиненные домены
     tick=$((tick+1))
     if [ $((tick % 300)) -eq 0 ] && grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
       if [ -w "$HOSTS" ]; then
-        local need=0 domain ip alive
+        setup_curl_bypass >/dev/null 2>&1
+        local need=0 domain line ip mode seen alive
         for domain in "${DOMAINS[@]}"; do
-          alive=0
-          for ip in $(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk -v d="$domain" '$2==d {print $1}'); do
-            probe_ip "$domain" "$ip" >/dev/null 2>&1 && alive=1 && break
-          done
-          [ "$alive" = "0" ] && need=1
+          seen=0; alive=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            seen=1
+            ip=$(echo "$line" | awk '{print $1}')
+            mode=""
+            case "$line" in *"# ag-bypass"*) mode="bypass" ;; esac
+            probe_ip "$domain" "$ip" "$mode" >/dev/null 2>&1 && alive=1 && break
+          done <<< "$(sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | awk -v d="$domain" '$2==d {print}')"
+          [ "$seen" = "1" ] && [ "$alive" = "0" ] && need=1
         done
         [ "$need" = "1" ] && { echo "$(date '+%F %T') пин протух — рефреш" >> "$WATCH_LOG"; dns_pin >> "$WATCH_LOG" 2>&1; }
         ensure_pin_routes 2>/dev/null
@@ -755,44 +1069,73 @@ watch_loop() {
   done
 }
 
+run_systemctl_user() {
+  if [ "$(id -u)" -eq 0 ]; then
+    if [ -z "${SUDO_USER:-}" ] || [ ! -S "/run/user/$REAL_UID/bus" ]; then
+      echo "скрипт запущен от root без user-сессии systemd — запусти без sudo: bash ag_unlocker_linux.sh"
+      return 1
+    fi
+    sudo -u "$REAL_USER" \
+      XDG_RUNTIME_DIR="/run/user/$REAL_UID" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$REAL_UID/bus" \
+      systemctl --user "$@"
+  else
+    systemctl --user "$@"
+  fi
+}
+
 install_watchdog() {
   command -v systemctl >/dev/null 2>&1 || { err "systemd не найден — watchdog не ставится"; return 1; }
-  local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  if [ "$(id -u)" -eq 0 ] && [ -z "${SUDO_USER:-}" ]; then
+    err "Watchdog (systemd --user) должен ставиться в пользовательскую сессию. Запусти без sudo: bash $SELF_SCRIPT"
+    return 1
+  fi
   rm -f "$DECLINE_FLAG"
-  mkdir -p "$HOME/.config/systemd/user"
+  mkdir -p "$REAL_HOME/.config/systemd/user"
   cat > "$WATCH_UNIT" <<EOF
 [Unit]
 Description=Antigravity unlocker watchdog (auto-repatch)
 
 [Service]
-ExecStart=/bin/bash $self --watch
+ExecStart=/bin/bash "$SELF_SCRIPT" --watch
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=default.target
 EOF
-  systemctl --user daemon-reload
-  if systemctl --user enable --now "$WATCH_LABEL.service" 2>/dev/null; then
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    chown -R "$REAL_USER" "$REAL_HOME/.config/systemd/user" 2>/dev/null || true
+  fi
+  local sc_err
+  if ! sc_err=$(run_systemctl_user daemon-reload 2>&1); then
+    err "systemctl --user daemon-reload не удался: ${sc_err:-неизвестная ошибка}"
+    rm -f "$WATCH_UNIT"
+    return 1
+  fi
+  if sc_err=$(run_systemctl_user enable --now "$WATCH_LABEL.service" 2>&1); then
     ok "Watchdog установлен (systemd --user, Restart=always). Лог: $WATCH_LOG"
-    loginctl enable-linger "$USER" 2>/dev/null   # жить без активной сессии
+    loginctl enable-linger "$REAL_USER" 2>/dev/null || true
     info "После автообновления Antigravity патч восстановится сам через ~5 секунд."
     info "Установка в /opt от root: репатч оттуда требует прав — watchdog напишет в лог."
   else
-    err "systemctl --user не удался"; return 1
+    err "systemctl --user не удался: ${sc_err:-неизвестная ошибка}"
+    rm -f "$WATCH_UNIT"
+    return 1
   fi
 }
 
 uninstall_watchdog() {
-  systemctl --user disable --now "$WATCH_LABEL.service" 2>/dev/null && ok "Watchdog остановлен"
-  rm -f "$WATCH_UNIT"
-  systemctl --user daemon-reload 2>/dev/null
+  if [ -f "$WATCH_UNIT" ]; then
+    run_systemctl_user disable --now "$WATCH_LABEL.service" >/dev/null 2>&1 && ok "Watchdog остановлен"
+    rm -f "$WATCH_UNIT"
+    run_systemctl_user daemon-reload >/dev/null 2>&1 || true
+  fi
 }
 
 # ---------------------------------------------------------------- status
 show_status() {
-  find_installs
-  [ ${#INSTALLS[@]} -eq 0 ] && { err "Antigravity не найден"; return 1; }
+  find_installs || { err "Antigravity не найден"; return 1; }
   local RES
   for RES in "${INSTALLS[@]}"; do
     info "Установка: $RES"
@@ -809,6 +1152,9 @@ show_status() {
     fi
     collect_targets "$RES"
     local f in_cnt out_cnt
+    if [ ${#TARGETS[@]} -eq 0 ] && [ -d "$RES/app/extensions/agy" ]; then
+      info "IDE 2.6+: бэкенд вынесен в ~/.gemini/bin/agy (см. ниже)"
+    fi
     for f in "${TARGETS[@]}"; do
       in_cnt=$(perl -0777 -ne 'my $c=()=/ineligible/g; print $c' "$f" 2>/dev/null || echo 0)
       out_cnt=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$f" 2>/dev/null || echo 0)
@@ -821,25 +1167,92 @@ show_status() {
       fi
     done
   done
+  local agy
+  for agy in "${AGY_BINS[@]}"; do
+    local i o
+    i=$(perl -0777 -ne 'my $c=()=/ineligible/g; print $c' "$agy" 2>/dev/null || echo 0)
+    o=$(perl -0777 -ne 'my $c=()=/inexigible/g; print $c' "$agy" 2>/dev/null || echo 0)
+    if [ "$o" -gt 0 ]; then
+      ok "agy пропатчен ($o вхожд.): $agy"
+    elif [ "$i" -gt 0 ]; then
+      warn "agy НЕ пропатчен ($i вхожд.): $agy"
+    else
+      warn "agy: строка не найдена — новая сборка?: $agy"
+    fi
+  done
   if grep -q "$MARKER_BEGIN" "$HOSTS" 2>/dev/null; then
     ok "hosts-блок:"
     sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | sed '1d;$d' | sed 's/^/    /'
+    if ! sed -n "/^${MARKER_BEGIN}$/,/^${MARKER_END}$/p" "$HOSTS" | grep -q "daily-cloudcode-pa.googleapis.com"; then
+      warn "В hosts-блоке нет daily-cloudcode-pa.googleapis.com — обнови DNS-пин (пункт 3)"
+    fi
   else
     info "hosts-блока нет (режим «без VPN» не настроен)"
   fi
+  if vpn_active; then
+    local dev; dev=$(phys_iface)
+    info "Сеть: VPN активен (физический интерфейс: ${dev:-не определён})"
+  else
+    info "Сеть: VPN не обнаружен"
+  fi
+  if [ -f "$WATCH_UNIT" ]; then
+    if run_systemctl_user is-active "$WATCH_LABEL.service" >/dev/null 2>&1; then
+      ok "Watchdog: установлен и активен ($WATCH_UNIT)"
+    else
+      warn "Watchdog: юнит есть, но сервис не активен ($WATCH_UNIT)"
+    fi
+  else
+    info "Watchdog: выключен"
+  fi
 }
 
-# ---------------------------------------------------------------- menu / main
-[ "$1" = "--watch" ] && { watch_loop; exit 0; }
+# ---------------------------------------------------------------- privileged dispatch & main
+dispatch_privileged() {
+  local action="$1"
+  find_installs || true
+  case "$action" in
+    unlock)
+      [ ${#INSTALLS[@]} -eq 0 ] && [ ${#AGY_BINS[@]} -eq 0 ] && { err "Antigravity не найден"; return 1; }
+      kill_processes
+      local RES
+      for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done
+      patch_cli
+      dns_pin
+      ;;
+    patch)
+      [ ${#INSTALLS[@]} -eq 0 ] && [ ${#AGY_BINS[@]} -eq 0 ] && { err "Antigravity не найден"; return 1; }
+      kill_processes
+      local RES
+      for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done
+      patch_cli
+      ;;
+    dns_pin)
+      dns_pin
+      ;;
+    revert)
+      kill_processes
+      local RES
+      for RES in "${INSTALLS[@]}"; do unpatch_binaries "$RES"; revert_ide_js "$RES"; done
+      revert_cli
+      remove_hosts_block
+      ;;
+    *) err "Неизвестное действие: $action"; return 1 ;;
+  esac
+}
 
 trap '[ -n "$HELPER" ] && rm -f "$HELPER" 2>/dev/null' EXIT
 
-find_installs
-if [ ${#INSTALLS[@]} -gt 0 ]; then
-  say "Найдено установок: ${#INSTALLS[@]}"
-  printf '  - %s\n' "${INSTALLS[@]}"
+case "$1" in
+  --watch)      AG_NO_ELEVATE=1; watch_loop; exit 0 ;;
+  --privileged) dispatch_privileged "$2"; exit $? ;;
+esac
+
+find_installs || true
+if [ ${#INSTALLS[@]} -gt 0 ] || [ ${#AGY_BINS[@]} -gt 0 ]; then
+  [ ${#INSTALLS[@]} -gt 0 ] && { say "Найдено установок: ${#INSTALLS[@]}"; printf '  - %s\n' "${INSTALLS[@]}"; }
+  [ ${#AGY_BINS[@]} -gt 0 ] && { say "Найдено agy (CLI / IDE 2.6+ / VS Code): ${#AGY_BINS[@]}"; printf '  - %s\n' "${AGY_BINS[@]}"; }
 else
-  warn "Antigravity не найден. Установи .deb/.rpm, распакуй tar.gz или поставь CLI (agy) с https://antigravity.google/download и перезапусти скрипт."
+  warn "Antigravity не найден. Установи .deb/.rpm, распакуй tar.gz, поставь CLI (agy) или расширение VS Code и перезапусти скрипт."
   warn "В AppImage-версии патч невозможен (файл временный) — используй .deb/.rpm/tar.gz."
 fi
 
@@ -860,22 +1273,20 @@ while true; do
   printf "Выбор: "
   read -r choice || { say ""; exit 0; }
   case "$choice" in
-    1) [ ${#INSTALLS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
-       kill_processes
-       for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done
-       dns_pin ;;
-    2) [ ${#INSTALLS[@]} -eq 0 ] && { err "Antigravity не найден"; continue; }
-       kill_processes
-       for RES in "${INSTALLS[@]}"; do patch_install "$RES"; done ;;
-    3) dns_pin ;;
+    1) run_privileged unlock ;;
+    2) run_privileged patch ;;
+    3) run_privileged dns_pin ;;
     4) show_status ;;
-    5) for RES in "${INSTALLS[@]}"; do kill_processes; unpatch_binaries "$RES"; revert_ide_js "$RES"; done
-       remove_hosts_block
+    5) run_privileged revert
        uninstall_watchdog
        touch "$DECLINE_FLAG"
+       [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && chown "$REAL_USER" "$DECLINE_FLAG" 2>/dev/null || true
        ok "Полный откат завершён." ;;
     6) if [ -f "$WATCH_UNIT" ]; then
-         uninstall_watchdog; touch "$DECLINE_FLAG"; ok "Watchdog выключен."
+         uninstall_watchdog
+         touch "$DECLINE_FLAG"
+         [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && chown "$REAL_USER" "$DECLINE_FLAG" 2>/dev/null || true
+         ok "Watchdog выключен."
        else
          install_watchdog
        fi ;;
